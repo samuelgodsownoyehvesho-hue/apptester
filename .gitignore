@@ -1,0 +1,38 @@
+# --- Secrets: never commit these ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Artifacts produced by runs ---
+# Screenshots, videos, HAR files and traces are bulky and may contain
+# captured application data. Do not commit them.
+artifacts/
+crucible.db
+crucible.db-journal
+
+# --- Node (guinea pig app) ---
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
