@@ -9,6 +9,7 @@ verified before anything expensive starts.
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
@@ -23,6 +24,9 @@ from crucible.llm.ledger import CostLedger
 from crucible.llm.providers import ModelClient
 from crucible.llm.router import ModelRouter, NoProviderAvailable, Tier
 from crucible.llm.sensitivity import DataClass, ProviderName, SensitivityViolation
+
+if TYPE_CHECKING:
+    from crucible.pipeline import PipelineResult
 
 app = typer.Typer(
     add_completion=False,
@@ -237,20 +241,163 @@ def ping() -> None:
 
 
 @app.command()
+def recon(
+    target: str = typer.Argument(..., help="URL of the application under test."),
+    max_pages: int = typer.Option(40, "--max-pages", help="Crawl page limit."),
+    db: str | None = typer.Option(None, "--db", help="Override the database URL."),
+) -> None:
+    """Crawl a target, build the app map, and persist it."""
+    settings, _, _ = _bootstrap()
+    if db:
+        object.__setattr__(settings, "crucible_db_url", db)
+
+    from pathlib import Path
+
+    from crucible.pipeline import crawl, persist_recon
+    from crucible.store.artifacts import ArtifactStore
+    from crucible.store.db import (
+        ensure_parent_dir,
+        init_db,
+        make_engine,
+        make_session_factory,
+    )
+
+    db_url = settings.crucible_db_url
+    ensure_parent_dir(db_url)
+    engine = make_engine(db_url)
+    init_db(engine)
+    session_factory = make_session_factory(engine)
+    artifacts = ArtifactStore(Path(settings.crucible_artifacts_dir))
+
+    async def _crawl() -> tuple[str, str, int, int, int, list[str]]:
+        app_map = await crawl(target, max_pages=max_pages)
+        target_id, run_id = persist_recon(target, app_map, session_factory, artifacts)
+        return (
+            target_id,
+            run_id,
+            len(app_map.routes),
+            len(app_map.forms),
+            len(app_map.unlabelled_controls),
+            app_map.notes,
+        )
+
+    try:
+        target_id, run_id, routes, forms, unlabelled, notes = asyncio.run(_crawl())
+    except Exception as exc:
+        console.print(f"[red]Recon failed: {type(exc).__name__}: {exc}[/red]")
+        raise typer.Exit(code=1) from None
+
+    table = Table(title="App map")
+    table.add_column("Metric")
+    table.add_column("Count", justify="right")
+    table.add_row("Routes discovered", str(routes))
+    table.add_row("Forms", str(forms))
+    table.add_row("Unlabelled controls", str(unlabelled))
+    console.print(table)
+    for note in notes:
+        console.print(f"[dim]note: {note}[/dim]")
+    console.print(
+        f"[green]Persisted[/green] target [bold]{target_id}[/bold], "
+        f"run [bold]{run_id}[/bold]"
+    )
+
+
+@app.command()
 def run(
     target: str = typer.Argument(..., help="URL of the application under test."),
+    db: str | None = typer.Option(None, "--db", help="Override the database URL."),
+    no_benchmark: bool = typer.Option(False, "--no-benchmark", help="Skip scoring."),
 ) -> None:
-    """Test an application. Not implemented yet; arrives with the recon phase."""
+    """Run the full pipeline: recon, plan, execute, judge, triage, score."""
+    settings, _, _ = _bootstrap()
+    if db:
+        object.__setattr__(settings, "crucible_db_url", db)
+
+    from pathlib import Path
+
+    from crucible.pipeline import run_pipeline
+    from crucible.store.artifacts import ArtifactStore
+    from crucible.store.db import (
+        ensure_parent_dir,
+        init_db,
+        make_engine,
+        make_session_factory,
+    )
+    from crucible.store.models import VerdictDecision
+
+    db_url = settings.crucible_db_url
+    ensure_parent_dir(db_url)
+    engine = make_engine(db_url)
+    init_db(engine)
+    session_factory = make_session_factory(engine)
+    artifacts = ArtifactStore(Path(settings.crucible_artifacts_dir))
+
+    async def _execute() -> PipelineResult:
+        return await run_pipeline(
+            target,
+            settings,
+            session_factory,
+            artifacts,
+            with_benchmark=not no_benchmark,
+        )
+
+    try:
+        result: PipelineResult = asyncio.run(_execute())
+    except Exception as exc:
+        console.print(f"[red]Run failed: {type(exc).__name__}: {exc}[/red]")
+        raise typer.Exit(code=1) from None
+
+    decision_style = {
+        VerdictDecision.BUG: "[bold red]BUG[/bold red]",
+        VerdictDecision.NOT_A_BUG: "[bold green]NOT_A_BUG[/bold green]",
+        VerdictDecision.INSUFFICIENT_EVIDENCE: (
+            "[bold yellow]INSUFFICIENT_EVIDENCE[/bold yellow]"
+        ),
+    }[result.decision]
+
     console.print(
         Panel(
-            f"Target: [bold]{target}[/bold]\n\n"
-            "The pipeline (recon → plan → execute → oracle) is not built yet.\n"
-            "Available today: [bold]doctor[/bold], [bold]models[/bold], [bold]ping[/bold].",
-            title="not implemented",
-            border_style="yellow",
+            f"Run [bold]{result.run_id}[/bold] against {target}\n"
+            f"Verdict: {decision_style}",
+            title="pipeline result",
+            expand=False,
         )
     )
-    raise typer.Exit(code=2)
+
+    stages = Table(title="Stage summary")
+    stages.add_column("Stage")
+    stages.add_column("Result")
+    stages.add_row("Recon", f"{result.routes} routes")
+    stages.add_row("Plan", f"{result.cases} cases")
+    stages.add_row("Execute", f"{result.executions} executions")
+    stages.add_row("Triage", f"{result.findings} finding(s)")
+    console.print(stages)
+
+    violated = [outcome for outcome in result.outcomes if outcome.violated is True]
+    if violated:
+        detail = Table(title="Invariant violations (evidence)")
+        detail.add_column("Signal")
+        detail.add_column("Detail")
+        for outcome in violated:
+            detail.add_row(outcome.signal, outcome.detail)
+        console.print(detail)
+
+    benchmark = result.benchmark
+    if benchmark is not None:
+        score_table = Table(title="Benchmark (vs declared defects)")
+        score_table.add_column("Metric")
+        score_table.add_column("Value", justify="right")
+        score_table.add_row("Declared active", str(benchmark.declared_active))
+        score_table.add_row("Found", str(benchmark.found))
+        score_table.add_row("Recall", f"{benchmark.recall:.0%}")
+        score_table.add_row("Precision", f"{benchmark.precision:.0%}")
+        if benchmark.missed:
+            score_table.add_row("Missed", ", ".join(benchmark.missed))
+        if benchmark.false_positives:
+            score_table.add_row(
+                "False positives", ", ".join(benchmark.false_positives)
+            )
+        console.print(score_table)
 
 
 if __name__ == "__main__":

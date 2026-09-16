@@ -1,0 +1,276 @@
+"""Pipeline tests against the behavioural twin: full stack, zero network.
+
+These run the *real* pipeline — recon over a canned fetcher, planning,
+execution against the in-memory target, oracle signals, triage, benchmark
+scoring — with the only fake parts being the transports. A failure here is a
+failure in crucible's own code, not in a fixture mismatch, which is what makes
+these tests worth their runtime.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+from sqlalchemy.orm import Session, sessionmaker
+
+from crucible.benchmark.score import Manifest, fetch_manifest, score
+from crucible.core.config import Settings
+from crucible.execute.checks import CheckResult
+from crucible.execute.client import ApiResponse, AppClient
+from crucible.pipeline import run_pipeline
+from crucible.recon.fetcher import FetchResult, HttpFetcher
+from crucible.store.artifacts import ArtifactStore
+from crucible.store.db import init_db, make_engine, make_session_factory
+from crucible.store.models import Finding, VerdictDecision
+from crucible.triage.cluster import cluster
+from tests.fake_target import FakeGuineaPig
+
+BUGGED = {
+    "CART_QTY_IGNORED",
+    "EMPTY_CART_STALE_TOTAL",
+    "DISCOUNT_STACKS",
+    "LEXICOGRAPHIC_SORT",
+    "PAGINATION_OVERLAP",
+    "CASE_SENSITIVE_SEARCH",
+    "CHECKOUT_ACCEPTS_NEGATIVE_QTY",
+    "BROKEN_FOOTER_LINK",
+}
+
+
+class StaticSiteFetcher(HttpFetcher):
+    """Serves a tiny HTML site so recon runs without network.
+
+    Subclasses the real fetcher so the type matches the pipeline signature;
+    ``fetch`` never touches HTTP.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    async def fetch(self, url: str) -> FetchResult:
+        page = (
+            "<html><head><title>Shop</title></head><body>"
+            '<a href="/catalog">Catalog</a>'
+            '<a href="/cart">Cart</a>'
+            '<a href="/returns">Returns</a>'
+            "</body></html>"
+        )
+        return FetchResult(url=url, status=200, content_type="text/html", text=page)
+
+    async def aclose(self) -> None:
+        return None
+
+
+class MapOnlyClient(AppClient):
+    """Returns 404 for everything; used for recon-only plumbing tests."""
+
+    async def get(self, path: str, *, params: dict[str, str] | None = None) -> ApiResponse:
+        return ApiResponse(status=404, text="not found")
+
+    async def post(self, path: str, json_body: Any) -> ApiResponse:
+        return ApiResponse(status=404, text="not found")
+
+    async def delete(self, path: str, *, params: dict[str, str] | None = None) -> ApiResponse:
+        return ApiResponse(status=404, text="not found")
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.fixture()
+def db(tmp_path: Path) -> Iterator[sessionmaker[Session]]:
+    engine = make_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    init_db(engine)
+    yield make_session_factory(engine)
+    engine.dispose()
+
+
+@pytest.fixture()
+def artifacts(tmp_path: Path) -> ArtifactStore:
+    return ArtifactStore(tmp_path / "artifacts")
+
+
+def _settings() -> Settings:
+    return Settings(
+        gemini_api_key="",
+        nvidia_api_key="",
+        enable_gemini=False,
+        enable_nvidia=False,
+        _env_file=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_buggy_target_is_scored_as_buggy(
+    db: sessionmaker[Session], artifacts: ArtifactStore
+) -> None:
+    """Every simulated defect should be found, and none other than those."""
+    fake = FakeGuineaPig(simulate=BUGGED)
+    result = await run_pipeline(
+        "http://guinea.test",
+        _settings(),
+        db,
+        artifacts,
+        fetcher=StaticSiteFetcher(),
+        app_client=fake,
+    )
+
+    assert result.decision is VerdictDecision.BUG
+    assert result.benchmark is not None
+    report = result.benchmark
+
+    # The 8 simulated defects are exactly the ones reachable without a
+    # browser; the 2 others (accessibility, truncation) are not.
+    assert sorted(report.true_positives) == sorted(BUGGED)
+    assert report.false_positives == []
+    assert report.recall == pytest.approx(1.0)
+    assert report.precision == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_clean_target_produces_no_findings(
+    db: sessionmaker[Session], artifacts: ArtifactStore
+) -> None:
+    """A defect-free target must yield zero findings — the precision trap."""
+    fake = FakeGuineaPig(simulate=set())
+    result = await run_pipeline(
+        "http://guinea.test",
+        _settings(),
+        db,
+        artifacts,
+        fetcher=StaticSiteFetcher(),
+        app_client=fake,
+    )
+
+    assert result.decision is VerdictDecision.NOT_A_BUG
+    assert result.findings == 0
+    assert result.benchmark is not None
+    assert result.benchmark.missed == []
+    assert result.benchmark.false_positives == []
+    assert result.benchmark.recall == pytest.approx(1.0)
+    assert result.benchmark.precision == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_single_mutant_is_isolated(
+    db: sessionmaker[Session], artifacts: ArtifactStore
+) -> None:
+    """One active defect: found, and nothing else reported."""
+    fake = FakeGuineaPig(simulate={"CART_QTY_IGNORED"})
+    result = await run_pipeline(
+        "http://guinea.test",
+        _settings(),
+        db,
+        artifacts,
+        fetcher=StaticSiteFetcher(),
+        app_client=fake,
+    )
+
+    assert result.decision is VerdictDecision.BUG
+    assert result.benchmark is not None
+    assert result.benchmark.true_positives == ["CART_QTY_IGNORED"]
+    assert result.benchmark.false_positives == []
+    # Recall is measured over the mutants that are *active in this run*, not
+    # over the whole catalogue: the other seven are not present, so counting
+    # them as misses would understate recall against a target that was asked
+    # to exhibit exactly one defect.
+    assert result.benchmark.declared_active == 1
+    assert result.benchmark.recall == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_artifacts_are_written(
+    db: sessionmaker[Session], artifacts: ArtifactStore
+) -> None:
+    fake = FakeGuineaPig(simulate=set())
+    result = await run_pipeline(
+        "http://guinea.test",
+        _settings(),
+        db,
+        artifacts,
+        fetcher=StaticSiteFetcher(),
+        app_client=fake,
+    )
+
+    keys = {ref.key for ref in artifacts.list_run(result.run_id)}
+    assert any("app_map" in key for key in keys)
+    assert any("benchmark" in key for key in keys)
+
+
+@pytest.mark.asyncio
+async def test_findings_persist_with_evidence(
+    db: sessionmaker[Session], artifacts: ArtifactStore
+) -> None:
+    fake = FakeGuineaPig(simulate={"DISCOUNT_STACKS"})
+    result = await run_pipeline(
+        "http://guinea.test",
+        _settings(),
+        db,
+        artifacts,
+        fetcher=StaticSiteFetcher(),
+        app_client=fake,
+    )
+
+    with db() as session:
+        rows = session.query(Finding).filter(Finding.run_id == result.run_id).all()
+    assert len(rows) == 1
+    finding = rows[0]
+    assert finding.matched_bug_id == "DISCOUNT_STACKS"
+    signals = finding.evidence["signals"]
+    assert any(signal["violated"] is True for signal in signals)
+
+
+def test_score_flags_label_without_violated_signal() -> None:
+    """A finding claiming a bug id without a violated signal is a miss."""
+    manifest = Manifest(
+        all_ids=frozenset({"X"}), active_ids=frozenset({"X"}), selection="X"
+    )
+    # Construct the claimed evidence by hand: cluster() only emits drafts for
+    # violated signals, so simulate a stale label on a persisted finding.
+    outcome = CheckResult(
+        check_id="cart_quantity_arithmetic",
+        lane="arithmetic",
+        observation="",
+        facts={"expected_total": 20.0, "reported_total": 20.0},
+    )
+    from crucible.oracle.signals import SIGNALS_BY_CHECK
+
+    signals = [signal(outcome) for signal in SIGNALS_BY_CHECK["cart_quantity_arithmetic"]]
+    finding = Finding(
+        run_id="run_x",
+        title="claimed",
+        matched_bug_id="X",
+        evidence={"signals": [signal.as_dict() for signal in signals]},
+    )
+
+    report = score(manifest, [finding], signals)
+    assert report.true_positives == []
+    assert report.missed == ["X"]
+    assert report.found == 0
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_requires_json() -> None:
+    client = MapOnlyClient()
+    with pytest.raises(ValueError, match="manifest unavailable"):
+        await fetch_manifest(client)
+    await client.aclose()
+
+
+def test_cluster_deduplicates_shared_evidence() -> None:
+    """Two violated signals on one defect collapse to one finding."""
+    result = CheckResult(
+        check_id="cart_quantity_arithmetic",
+        lane="arithmetic",
+        observation="",
+        facts={"expected_total": 20.0, "reported_total": 10.0},
+    )
+    from crucible.oracle.signals import SIGNALS_BY_CHECK
+
+    signals = [signal(result) for signal in SIGNALS_BY_CHECK["cart_quantity_arithmetic"]]
+    drafts = cluster(signals)
+    assert len(drafts) == 1
+    assert drafts[0].suspected_bug_id == "CART_QTY_IGNORED"

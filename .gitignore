@@ -24,6 +24,11 @@ htmlcov/
 artifacts/
 crucible.db
 crucible.db-journal
+# WAL mode keeps a write-ahead log and shared-memory file beside the database.
+crucible.db-wal
+crucible.db-shm
+*.db-wal
+*.db-shm
 
 # --- Node (guinea pig app) ---
 node_modules/
