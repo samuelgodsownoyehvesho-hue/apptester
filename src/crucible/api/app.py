@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -96,6 +97,7 @@ class RunState:
                 "executions": result.executions,
                 "findings": result.findings,
                 "benchmark": result.benchmark.as_dict() if result.benchmark else None,
+                "browser": result.browser.as_dict() if result.browser else None,
                 "citations": [
                     {
                         "signal": outcome.signal,
@@ -273,6 +275,23 @@ def create_app(settings: Settings) -> FastAPI:
         payload = state.summary()
         payload["finding_details"] = registry.findings(state)
         return payload
+
+    @app.get("/api/artifacts/{key:path}")
+    async def artifact(key: str) -> FileResponse:
+        """Serve a stored artifact, such as the browser video.
+
+        Resolution goes through the store's own key validation rather than
+        joining paths here, so the traversal guard cannot be bypassed by a
+        second implementation that forgets it.
+        """
+        try:
+            path = artifacts.path_for(key)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail=f"no artifact {key!r}")
+        media_type, _ = mimetypes.guess_type(path.name)
+        return FileResponse(path, media_type=media_type or "application/octet-stream")
 
     @app.get("/api/runs/{stream_id}/events")
     async def run_events(stream_id: str) -> StreamingResponse:

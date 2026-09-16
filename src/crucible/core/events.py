@@ -43,6 +43,11 @@ class EventType(StrEnum):
     EXEC_CASE_FINISHED = "exec.case_finished"
     EXEC_FINISHED = "exec.finished"
 
+    BROWSER_STARTED = "browser.started"
+    BROWSER_PAGE_VISITED = "browser.page_visited"
+    BROWSER_FINISHED = "browser.finished"
+    BROWSER_UNAVAILABLE = "browser.unavailable"
+
     ORACLE_SIGNAL = "oracle.signal"
     VERDICT_REACHED = "oracle.verdict"
     FINDING_RECORDED = "triage.finding"

@@ -309,8 +309,11 @@ def run(
     target: str = typer.Argument(..., help="URL of the application under test."),
     db: str | None = typer.Option(None, "--db", help="Override the database URL."),
     no_benchmark: bool = typer.Option(False, "--no-benchmark", help="Skip scoring."),
+    no_browser: bool = typer.Option(
+        False, "--no-browser", help="Skip the browser lane (no video or screenshots)."
+    ),
 ) -> None:
-    """Run the full pipeline: recon, plan, execute, judge, triage, score."""
+    """Run the full pipeline: recon, plan, execute, judge, browse, triage, score."""
     settings, _, _ = _bootstrap()
     if db:
         object.__setattr__(settings, "crucible_db_url", db)
@@ -341,6 +344,7 @@ def run(
             session_factory,
             artifacts,
             with_benchmark=not no_benchmark,
+            with_browser=not no_browser,
         )
 
     try:
@@ -372,6 +376,12 @@ def run(
     stages.add_row("Recon", f"{result.routes} routes")
     stages.add_row("Plan", f"{result.cases} cases")
     stages.add_row("Execute", f"{result.executions} executions")
+    if result.browser is not None:
+        stages.add_row(
+            "Browse",
+            f"{len(result.browser.screenshots)} page(s) recorded in "
+            f"{result.browser.browser}",
+        )
     stages.add_row("Triage", f"{result.findings} finding(s)")
     console.print(stages)
 
@@ -400,6 +410,15 @@ def run(
                 "False positives", ", ".join(benchmark.false_positives)
             )
         console.print(score_table)
+
+    if result.browser is not None and result.browser.video_key:
+        recorded = artifacts.path_for(result.browser.video_key)
+        console.print(f"Browser recording: [bold]{recorded}[/bold]")
+        if result.browser.console_errors:
+            console.print(
+                f"[yellow]{len(result.browser.console_errors)} browser error(s) "
+                "captured; see the dashboard or the run artifacts.[/yellow]"
+            )
 
 
 @app.command()

@@ -110,6 +110,23 @@
   .cite:first-of-type { border-top: 0; }
   .cite .sig { color: var(--accent); font-family: var(--mono); font-size: 11.5px; }
   .cite .det { color: var(--text); }
+
+  #browserSection { display: none; margin: 0 22px 40px; }
+  #browserVideo {
+    width: 100%; max-width: 880px; border-radius: 10px; background: #000;
+    display: block; border: 1px solid var(--line);
+  }
+  .shots { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 15px; }
+  .shot { width: 186px; }
+  .shot img {
+    width: 100%; border-radius: 8px; border: 1px solid var(--line);
+    display: block; background: #000;
+  }
+  .shot .rt { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 4px; }
+  #consoleLog {
+    font-family: var(--mono); font-size: 11.5px; color: #d9a7a2;
+    max-height: 190px; overflow: auto; padding-top: 8px; line-height: 1.6;
+  }
 </style>
 </head>
 <body>
@@ -142,6 +159,18 @@
     </section>
   </div>
 </main>
+
+<section id="browserSection">
+  <h2>What the browser saw <span class="badge" id="browserLabel"></span></h2>
+  <div class="pad">
+    <video id="browserVideo" controls loop muted playsinline preload="metadata"></video>
+    <div class="shots" id="shots"></div>
+    <details id="consoleWrap" style="display:none">
+      <summary>Browser errors (<span id="consoleCount">0</span>)</summary>
+      <div id="consoleLog"></div>
+    </details>
+  </div>
+</section>
 
 <script>
 (() => {
@@ -199,6 +228,16 @@
       }
       case "exec.finished":
         return line("", `<span class="k-stage">Executed</span> ${p.executed} checks`);
+      case "browser.started":
+        return line("", `<span class="k-stage">Browser</span> — opening a real browser to watch ${p.routes} pages`);
+      case "browser.page_visited":
+        return line("", `<span class="k-page">browser</span> ${esc(p.route)} ${p.status >= 400
+          ? `<span class="k-bad">\u2192 ${esc(p.status)}</span>`
+          : `<span class="k-good">\u2192 ${esc(p.status)}</span>`} <span class="k-mute">recorded</span>`);
+      case "browser.finished":
+        return line("", `<span class="k-stage">Browser done</span> — ${p.pages} pages, ${p.console_errors} browser error(s)${p.video_key ? ", video saved" : ""}`);
+      case "browser.unavailable":
+        return line("err", `<span class="k-bad">No browser</span> ${esc(p.reason)}`);
       case "triage.finding":
         return line("", `<span class="k-bad">finding</span> ${esc(p.title ?? p.bug_id ?? "")}`);
       case "oracle.verdict":
@@ -251,6 +290,31 @@
       `;
     }
 
+    if (d.browser) {
+      const b = d.browser;
+      $("browserSection").style.display = "";
+      $("browserLabel").textContent = b.browser;
+      if (b.video_key) {
+        const video = $("browserVideo");
+        const src = `/api/artifacts/${b.video_key}`;
+        // Only reassign when it changed, or the video restarts on every poll.
+        if (!video.src.endsWith(b.video_key)) video.src = src;
+      }
+      $("shots").innerHTML = (b.screenshots || []).map((s) => `
+        <div class="shot">
+          <a href="/api/artifacts/${s.key}" target="_blank" rel="noopener">
+            <img src="/api/artifacts/${s.key}" alt="${esc(s.route)}">
+          </a>
+          <div class="rt">${esc(s.route)}${s.status ? " \u00b7 " + esc(s.status) : ""}</div>
+        </div>`).join("");
+
+      const errs = b.console_errors || [];
+      $("consoleCount").textContent = errs.length;
+      $("consoleWrap").style.display = errs.length ? "" : "none";
+      $("consoleLog").innerHTML = errs.map((e) =>
+        `<div>[${esc(e.kind)}] ${esc(e.route)} \u2014 ${esc(e.text)}</div>`).join("");
+    }
+
     if (d.finding_details?.length) {
       $("findingCount").textContent = d.finding_details.length;
       $("findings").innerHTML = d.finding_details.map((f) => `
@@ -274,6 +338,10 @@
     $("result").innerHTML = '<p class="empty">Running…</p>';
     $("findings").innerHTML = '<p class="pad empty">No findings yet.</p>';
     $("findingCount").textContent = "0";
+    $("browserSection").style.display = "none";
+    $("browserVideo").removeAttribute("src");
+    $("shots").innerHTML = "";
+    $("consoleLog").innerHTML = "";
     go.disabled = true;
     started = Date.now();
     dot.className = "dot live"; statusText.textContent = "starting";

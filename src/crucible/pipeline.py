@@ -20,6 +20,11 @@ from crucible.benchmark.score import ScoreReport, fetch_manifest, score
 from crucible.core.config import Settings
 from crucible.core.events import EventBus, EventType
 from crucible.core.logging import get_logger
+from crucible.execute.browser import (
+    BrowserRecording,
+    BrowserUnavailable,
+    record_walk,
+)
 from crucible.execute.client import AppClient, HttpAppClient, reset_target
 from crucible.execute.runner import CheckRunner, ExecutionOutcome
 from crucible.oracle.signals import SIGNALS_BY_CHECK, SignalOutcome, reach_verdict
@@ -60,6 +65,8 @@ class PipelineResult:
     benchmark: ScoreReport | None
     app_map: AppMapData
     outcomes: list[SignalOutcome] = field(default_factory=list)
+    #: Video and screenshots from the browser lane, when it could run.
+    browser: BrowserRecording | None = None
 
     def summary(self) -> dict[str, Any]:
         """Flat dict for the CLI report."""
@@ -71,6 +78,7 @@ class PipelineResult:
             "executions": self.executions,
             "findings": self.findings,
             "benchmark": self.benchmark.as_dict() if self.benchmark else None,
+            "browser": self.browser.as_dict() if self.browser else None,
         }
 
 
@@ -224,6 +232,7 @@ async def run_pipeline(
     fetcher: HttpFetcher | None = None,
     app_client: AppClient | None = None,
     with_benchmark: bool = True,
+    with_browser: bool = True,
     bus: EventBus | None = None,
 ) -> PipelineResult:
     """Execute the full pipeline against ``base_url``.
@@ -312,6 +321,27 @@ async def run_pipeline(
         confidence=aggregate_confidence,
     )
 
+    # ---- browser walk -----------------------------------------------------
+    browser_recording: BrowserRecording | None = None
+    if with_browser:
+        # This lane is optional in a way the others are not: it needs a real
+        # browser, which may simply not be installable on a locked-down
+        # network. A missing browser must degrade the report, never fail the
+        # run -- the checks have already produced findings worth reporting.
+        try:
+            browser_recording = await record_walk(
+                base_url, app_map.route_paths, run_id, artifacts, bus=bus
+            )
+        except BrowserUnavailable as exc:
+            logger.warning("browser_lane_unavailable err=%s", exc)
+            await bus.emit(EventType.BROWSER_UNAVAILABLE, reason=str(exc))
+        except Exception as exc:
+            logger.exception("browser_lane_failed")
+            await bus.emit(
+                EventType.BROWSER_UNAVAILABLE,
+                reason=f"{type(exc).__name__}: {exc}",
+            )
+
     # ---- triage -----------------------------------------------------------
     with session_factory() as session:
         findings: list[Finding] = await write_findings(run_id, all_outcomes, bus)
@@ -362,4 +392,5 @@ async def run_pipeline(
         benchmark=benchmark_report,
         app_map=app_map,
         outcomes=all_outcomes,
+        browser=browser_recording,
     )

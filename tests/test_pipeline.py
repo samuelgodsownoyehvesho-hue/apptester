@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from crucible.benchmark.score import Manifest, fetch_manifest, score
 from crucible.core.config import Settings
+from crucible.execute.browser import BrowserUnavailable
 from crucible.execute.checks import CheckResult
 from crucible.execute.client import ApiResponse, AppClient, reset_target
 from crucible.pipeline import run_pipeline
@@ -364,6 +365,57 @@ async def test_a_run_does_not_inherit_the_previous_runs_state(
     # unit price exactly. A leaked discount would have shown less than $10.00.
     assert arithmetic.evidence["expected_total"] == pytest.approx(20.0)
     assert arithmetic.evidence["reported_total"] == pytest.approx(10.0)
+
+
+@pytest.mark.asyncio
+async def test_a_missing_browser_does_not_fail_the_run(
+    db: sessionmaker[Session], artifacts: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The browser lane is optional; a missing browser degrades, never breaks.
+
+    A real browser may be impossible to install on a locked-down network. The
+    checks have already produced findings worth reporting by the time this lane
+    runs, so losing them would be the wrong trade.
+    """
+
+    async def unavailable(*_args: object, **_kwargs: object) -> object:
+        raise BrowserUnavailable("no usable browser; tried bundled chromium, msedge")
+
+    monkeypatch.setattr("crucible.pipeline.record_walk", unavailable)
+
+    fake = FakeGuineaPig(simulate={"CART_QTY_IGNORED"})
+    result = await run_pipeline(
+        "http://guinea.test",
+        _settings(),
+        db,
+        artifacts,
+        fetcher=StaticSiteFetcher(),
+        app_client=fake,
+    )
+
+    assert result.browser is None
+    assert result.decision is VerdictDecision.BUG
+    assert result.benchmark is not None
+    assert result.benchmark.true_positives == ["CART_QTY_IGNORED"]
+
+
+@pytest.mark.asyncio
+async def test_browser_lane_can_be_switched_off(
+    db: sessionmaker[Session], artifacts: ArtifactStore
+) -> None:
+    fake = FakeGuineaPig(simulate=set())
+    result = await run_pipeline(
+        "http://guinea.test",
+        _settings(),
+        db,
+        artifacts,
+        fetcher=StaticSiteFetcher(),
+        app_client=fake,
+        with_browser=False,
+    )
+
+    assert result.browser is None
+    assert result.findings == 0
 
 
 def test_score_flags_label_without_violated_signal() -> None:
