@@ -10,7 +10,7 @@ flatter the agent and every downstream number would be fiction:
 * A declared defect with no matching finding is a miss. There is no partial
   credit and no "close enough".
 
-Ground truth is read from the target itself (``/api/_benchmark/bugs``), not
+Ground truth is read from the target itself (``/api/ground-truth/bugs``), not
 hardcoded here, so the scorer works against any mutant selection without
 edits. That endpoint is deliberately unlinked from the target's UI; the
 harness must fetch it explicitly, exactly because an exploring agent should
@@ -27,7 +27,7 @@ from crucible.oracle.signals import SignalOutcome
 from crucible.store.models import Finding
 from crucible.triage.cluster import cluster
 
-BENCHMARK_MANIFEST_PATH = "/api/_benchmark/bugs"
+BENCHMARK_MANIFEST_PATH = "/api/ground-truth/bugs"
 
 
 @dataclass(frozen=True, slots=True)

@@ -85,7 +85,7 @@ class FakeGuineaPig:
             return self._json(self._cart())
         if path == "/api/products":
             return self._json(self._catalog(params))
-        if path == "/api/_benchmark/bugs":
+        if path == "/api/ground-truth/bugs":
             if not self.with_manifest:
                 return ApiResponse(status=404, text="not found")
             return self._json(

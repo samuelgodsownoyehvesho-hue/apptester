@@ -64,6 +64,26 @@ class StaticSiteFetcher(HttpFetcher):
         return None
 
 
+class UnlabelledSiteFetcher(HttpFetcher):
+    """Serves a page whose form control has no accessible name.
+
+    The defect here lives in markup, not in an API, so it is the fetcher that
+    supplies it while the twin's manifest declares it active.
+    """
+
+    async def fetch(self, url: str) -> FetchResult:
+        page = (
+            "<html><head><title>Checkout</title></head><body>"
+            "<form action='/order' method='post'>"
+            "<input type='email' name='email' placeholder='you@example.com'>"
+            "</form></body></html>"
+        )
+        return FetchResult(url=url, status=200, content_type="text/html", text=page)
+
+    async def aclose(self) -> None:
+        return None
+
+
 class MapOnlyClient(AppClient):
     """Returns 404 for everything; used for recon-only plumbing tests."""
 
@@ -221,6 +241,37 @@ async def test_findings_persist_with_evidence(
     assert finding.matched_bug_id == "DISCOUNT_STACKS"
     signals = finding.evidence["signals"]
     assert any(signal["violated"] is True for signal in signals)
+
+
+@pytest.mark.asyncio
+async def test_recon_derived_signal_reaches_findings(
+    db: sessionmaker[Session], artifacts: ArtifactStore
+) -> None:
+    """A defect recon recorded must reach a finding and be scored.
+
+    Regression: the pipeline rebuilt the oracle's aggregation by hand and
+    dropped every recon-derived signal, so an unlabelled control that recon had
+    already observed was reported as a miss even though the fact was on disk.
+    """
+    fake = FakeGuineaPig(simulate={"UNLABELED_CHECKOUT_INPUT"})
+    result = await run_pipeline(
+        "http://guinea.test",
+        _settings(),
+        db,
+        artifacts,
+        fetcher=UnlabelledSiteFetcher(),
+        app_client=fake,
+    )
+
+    with db() as session:
+        rows = session.query(Finding).filter(Finding.run_id == result.run_id).all()
+    assert [row.matched_bug_id for row in rows] == ["UNLABELED_CHECKOUT_INPUT"]
+
+    assert result.decision is VerdictDecision.BUG
+    assert result.benchmark is not None
+    assert result.benchmark.true_positives == ["UNLABELED_CHECKOUT_INPUT"]
+    assert result.benchmark.recall == pytest.approx(1.0)
+    assert result.benchmark.precision == pytest.approx(1.0)
 
 
 def test_score_flags_label_without_violated_signal() -> None:

@@ -17,12 +17,18 @@ Phase 1, in progress. What exists today:
 | Run budgets with hard stops | ✅ implemented, tested |
 | Cost ledger with per-agent attribution | ✅ implemented, tested |
 | Structured logging (text + JSON) | ✅ implemented |
-| Storage (SQLite + local artifacts) | ⏳ not started |
-| Recon scout → app map | ⏳ not started |
-| Execution fabric (Playwright) | ⏳ not started |
-| Oracle signals → verdict | ⏳ not started |
-| Guinea pig app + mutant injector | ⏳ not started |
-| CLI | ⏳ not started |
+| Storage (SQLite + local artifacts) | ✅ implemented, tested |
+| Recon scout → app map | ✅ implemented, tested |
+| Test plan synthesis with risk ranking | ✅ implemented, tested |
+| API execution lane (checks + runner) | ✅ implemented, tested |
+| Oracle signals → verdict | ✅ implemented, tested (deterministic signals only) |
+| Triage → deduplicated findings | ✅ implemented, tested |
+| Benchmark scoring (recall / precision) | ✅ implemented, tested |
+| CLI (`doctor`, `recon`, `run`, `serve`) | ✅ implemented |
+| Live dashboard | ✅ implemented |
+| Guinea pig app + mutant registry | ✅ built, run manually |
+| Browser lane (Playwright) | ⏳ not started |
+| LLM-as-judge oracle signal | ⏳ not started — no reachable provider here |
 
 ## Why this exists
 
@@ -38,7 +44,8 @@ Prerequisites: Python 3.12+ (3.14 in use here), and `uv`.
 
 ```bash
 # 1. Create the virtualenv and install the foundation
-uv sync --extra dev
+#    `dev` and `api` are optional extras, so both must be named explicitly.
+uv sync --extra dev --extra api
 
 # 2. Configure providers
 cp .env.example .env
@@ -47,6 +54,24 @@ cp .env.example .env
 # 3. Run the test suite
 uv run pytest
 ```
+
+## Watch a run live
+
+The CLI prints one report when a run finishes. To watch a run *happen*:
+
+```bash
+uv run crucible serve            # dashboard on http://localhost:8000
+```
+
+Enter a URL, press **Start scan**, and the page streams every event as it
+occurs — each page crawled, each check run, each invariant violated. This
+matters because reconnaissance against a real application takes tens of seconds
+and issues dozens of requests, and a terminal that prints nothing until the end
+cannot distinguish *working* from *wedged*.
+
+A run can also be driven headlessly: `POST /api/runs` starts one and returns a
+stream id, and `GET /api/runs/{id}/events` is a server-sent event feed of the
+same events, so another front end can be built on it.
 
 ## Model providers
 
@@ -72,8 +97,9 @@ src/crucible/
 ├─ store/    # SQLite models, local artifact store
 ├─ recon/    # scout: crawl the target, build the app map
 ├─ plan/     # test case synthesis and risk ranking
-├─ execute/  # Playwright runner, record/replay
+├─ execute/  # API check lane: client, checks, runner (Playwright lane pending)
 ├─ oracle/   # independent verification signals -> verdict
+├─ api/      # live dashboard: run registry, SSE stream, single-page UI
 └─ cli.py    # command line entry point
 ```
 

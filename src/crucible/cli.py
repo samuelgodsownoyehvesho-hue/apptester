@@ -9,6 +9,8 @@ verified before anything expensive starts.
 from __future__ import annotations
 
 import asyncio
+import threading
+import webbrowser
 from typing import TYPE_CHECKING
 
 import typer
@@ -398,6 +400,40 @@ def run(
                 "False positives", ", ".join(benchmark.false_positives)
             )
         console.print(score_table)
+
+
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host", help="Interface to bind."),
+    port: int = typer.Option(8000, "--port", help="Port for the dashboard."),
+    open_browser: bool = typer.Option(
+        True, "--open/--no-open", help="Open the dashboard in a browser."
+    ),
+) -> None:
+    """Serve the live dashboard, where a run can be watched as it happens."""
+    settings, _, _ = _bootstrap()
+
+    try:
+        import uvicorn
+    except ImportError:
+        console.print(
+            "[red]The dashboard needs extra dependencies.[/red]\n"
+            "Install them with: [bold]uv sync --extra api[/bold]"
+        )
+        raise typer.Exit(code=1) from None
+
+    from crucible.api.app import create_app
+
+    shown = "localhost" if host in {"0.0.0.0", "127.0.0.1"} else host
+    url = f"http://{shown}:{port}"
+    console.print(f"Crucible dashboard at [bold]{url}[/bold]  (ctrl-c to stop)")
+
+    if open_browser:
+        # Delayed because the browser would otherwise beat the socket bind and
+        # land on a connection-refused page.
+        threading.Timer(1.0, webbrowser.open, args=[url]).start()
+
+    uvicorn.run(create_app(settings), host=host, port=port, log_level="warning")
 
 
 if __name__ == "__main__":

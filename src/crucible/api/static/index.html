@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Crucible — live run</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #171a23;
+    --panel-2: #1e222d;
+    --line: #2a2f3d;
+    --text: #e6e8ee;
+    --muted: #8b93a7;
+    --accent: #6aa9ff;
+    --ok: #4ec9a0;
+    --warn: #e2b341;
+    --bad: #f0736a;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    padding: 18px 22px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    background: var(--panel);
+  }
+  h1 { font-size: 17px; margin: 0; letter-spacing: .2px; }
+  h1 span { color: var(--muted); font-weight: 400; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .dot.live { background: var(--ok); animation: pulse 1.4s infinite; }
+  .dot.done { background: var(--accent); }
+  .dot.fail { background: var(--bad); }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+
+  form { display: flex; gap: 10px; padding: 18px 22px 0; flex-wrap: wrap; }
+  input[type=url] {
+    flex: 1 1 340px; padding: 11px 13px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--panel-2);
+    color: var(--text); font-family: var(--mono); font-size: 13px;
+  }
+  input[type=url]:focus { outline: none; border-color: var(--accent); }
+  button {
+    padding: 11px 20px; border-radius: 8px; border: 0; cursor: pointer;
+    background: var(--accent); color: #0b1020; font-weight: 600; font-size: 14px;
+  }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+
+  main {
+    display: grid; grid-template-columns: minmax(0,1.35fr) minmax(320px,1fr);
+    gap: 18px; padding: 18px 22px 40px;
+  }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+  section {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; overflow: hidden;
+  }
+  section > h2 {
+    margin: 0; padding: 12px 15px; font-size: 12px; letter-spacing: .09em;
+    text-transform: uppercase; color: var(--muted);
+    border-bottom: 1px solid var(--line); background: var(--panel-2);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  #feed {
+    height: 58vh; overflow-y: auto; padding: 10px 14px;
+    font-family: var(--mono); font-size: 12.5px;
+  }
+  .row { display: flex; gap: 9px; padding: 3px 0; align-items: baseline; }
+  .row .t { color: #59607a; flex: 0 0 58px; }
+  .row .m { min-width: 0; word-break: break-word; }
+  .k-stage  { color: var(--accent); font-weight: 600; }
+  .k-page   { color: #9d8bd6; }
+  .k-check  { color: #d6c68b; }
+  .k-bad    { color: var(--bad); }
+  .k-good   { color: var(--ok); }
+  .k-mute   { color: var(--muted); }
+  .row.err .m { color: var(--bad); }
+
+  .pad { padding: 14px 15px; }
+  dl.kv { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-size: 13.5px; }
+  dl.kv dt { color: var(--muted); }
+  dl.kv dd { margin: 0; font-family: var(--mono); }
+  .empty { color: var(--muted); font-size: 13px; }
+
+  .finding { padding: 11px 15px; border-top: 1px solid var(--line); }
+  .finding:first-of-type { border-top: 0; }
+  .finding .title { font-size: 13.5px; }
+  .finding .meta { color: var(--muted); font-size: 11.5px; font-family: var(--mono); margin-top: 3px; }
+  .badge {
+    display: inline-block; padding: 1px 7px; border-radius: 999px;
+    font-size: 10.5px; font-family: var(--mono); border: 1px solid var(--line); color: var(--muted);
+  }
+  .badge.high { color: var(--bad); border-color: #6d3835; }
+  .badge.medium { color: var(--warn); border-color: #6b5726; }
+  .score { font-size: 26px; font-family: var(--mono); }
+  details { margin-top: 10px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+  .cite { padding: 9px 0; border-top: 1px dashed var(--line); font-size: 12.5px; }
+  .cite:first-of-type { border-top: 0; }
+  .cite .sig { color: var(--accent); font-family: var(--mono); font-size: 11.5px; }
+  .cite .det { color: var(--text); }
+</style>
+</head>
+<body>
+<header>
+  <div class="dot" id="statusDot"></div>
+  <h1>Crucible <span>— watch the robot work</span></h1>
+  <span class="badge" id="statusText">idle</span>
+</header>
+
+<form id="form">
+  <input type="url" id="url" value="http://localhost:3100" spellcheck="false"
+         placeholder="http://localhost:3100" />
+  <button type="submit" id="go">Start scan</button>
+</form>
+
+<main>
+  <section>
+    <h2>Live activity <span class="badge" id="eventCount">0</span></h2>
+    <div id="feed"></div>
+  </section>
+
+  <div style="display:grid; gap:18px; align-content:start;">
+    <section>
+      <h2>Result</h2>
+      <div class="pad" id="result"><p class="empty">Nothing yet. Start a scan.</p></div>
+    </section>
+    <section>
+      <h2>Findings <span class="badge" id="findingCount">0</span></h2>
+      <div id="findings"><p class="pad empty">No findings yet.</p></div>
+    </section>
+  </div>
+</main>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const feed = $("feed");
+  const form = $("form");
+  const go = $("go");
+  const dot = $("statusDot");
+  const statusText = $("statusText");
+  let source = null;
+  let started = 0;
+
+  const stamp = () => {
+    const s = Math.floor((Date.now() - started) / 1000);
+    return `+${String(s).padStart(3, "0")}s`;
+  };
+
+  function line(cls, html) {
+    const row = document.createElement("div");
+    row.className = "row" + (cls === "err" ? " err" : "");
+    row.innerHTML = `<span class="t">${stamp()}</span><span class="m">${html}</span>`;
+    feed.appendChild(row);
+    feed.scrollTop = feed.scrollHeight;
+  }
+
+  const esc = (v) => String(v ?? "").replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]));
+
+  /** Turn one raw event into a sentence a human wants to read. */
+  function narrate(e) {
+    const p = e;
+    switch (e.type) {
+      case "run.started":
+        return line("", `<span class="k-stage">Run started</span> against ${esc(p.base_url)}`);
+      case "recon.started":
+        return line("", `<span class="k-stage">Recon</span> — exploring the site`);
+      case "recon.page_visited": {
+        const bad = p.status >= 400;
+        return line("", `<span class="k-page">page</span> ${esc(p.path)} ${bad
+          ? `<span class="k-bad">→ ${esc(p.status)} broken</span>`
+          : `<span class="k-good">→ ${esc(p.status)}</span>`}${p.title ? ` <span class="k-mute">(${esc(p.title)})</span>` : ""}`);
+      }
+      case "recon.finished":
+        return line("", `<span class="k-stage">Recon done</span> — ${p.routes} routes, ${p.forms} forms, ${p.failed} broken`);
+      case "plan.started":
+        return line("", `<span class="k-stage">Planning</span> — choosing what to test`);
+      case "plan.case_added":
+        return line("", `<span class="k-mute">plan</span> <span class="k-check">${esc(p.check_id)}</span> <span class="k-mute">risk ${esc(p.risk)}</span>`);
+      case "exec.started":
+        return line("", `<span class="k-stage">Executing</span> ${p.cases} checks`);
+      case "exec.case_started":
+        return line("", `<span class="k-mute">run</span> <span class="k-check">${esc(p.check_id)}</span>`);
+      case "exec.case_finished": {
+        const bad = p.had_error;
+        return line(bad ? "err" : "", `<span class="k-mute">done</span> <span class="k-check">${esc(p.check_id)}</span> <span class="k-mute">${Math.round(p.duration_ms)}ms</span>${bad ? ' <span class="k-bad">errored</span>' : ""}`);
+      }
+      case "exec.finished":
+        return line("", `<span class="k-stage">Executed</span> ${p.executed} checks`);
+      case "triage.finding":
+        return line("", `<span class="k-bad">finding</span> ${esc(p.title ?? p.bug_id ?? "")}`);
+      case "oracle.verdict":
+        return line("", `<span class="k-stage">Verdict</span> <b>${esc(p.decision)}</b> <span class="k-mute">confidence ${esc(p.confidence)}</span>`);
+      case "run.finished":
+        return line("", `<span class="k-stage">Finished</span> — ${p.findings} finding(s)`);
+      case "run.failed":
+        return line("err", `<span class="k-bad">Run failed</span> ${esc(p.error)}`);
+      case "stream.end":
+        return null;
+      default:
+        return line("", `<span class="k-mute">${esc(e.type)}</span>`);
+    }
+  }
+
+  async function refresh(streamId) {
+    const res = await fetch(`/api/runs/${streamId}`);
+    if (!res.ok) return;
+    const d = await res.json();
+
+    if (d.status === "running") {
+      dot.className = "dot live"; statusText.textContent = "running";
+    } else if (d.status === "succeeded") {
+      dot.className = "dot done"; statusText.textContent = "finished";
+    } else {
+      dot.className = "dot fail"; statusText.textContent = "failed";
+    }
+
+    if (d.decision) {
+      const b = d.benchmark;
+      $("result").innerHTML = `
+        <dl class="kv">
+          <dt>Verdict</dt><dd style="color:${{BUG:"var(--bad)",NOT_A_BUG:"var(--ok)"}[d.decision] || "var(--warn)"}">${esc(d.decision)}</dd>
+          <dt>Routes crawled</dt><dd>${d.routes}</dd>
+          <dt>Checks run</dt><dd>${d.executions}</dd>
+          <dt>Findings</dt><dd>${d.findings}</dd>
+        </dl>
+        ${b ? `<details open><summary>Accuracy against known defects</summary>
+          <div class="pad" style="padding:10px 0 0">
+            <dl class="kv">
+              <dt>Recall</dt><dd class="score">${Math.round(b.recall * 100)}%</dd>
+              <dt>Precision</dt><dd class="score">${Math.round(b.precision * 100)}%</dd>
+              <dt>Found</dt><dd>${b.found} of ${b.declared_active}</dd>
+              <dt>Missed</dt><dd>${b.missed.length ? esc(b.missed.join(", ")) : "—"}</dd>
+            </dl>
+          </div></details>` : ""}
+        ${d.citations?.length ? `<details><summary>Evidence (${d.citations.length})</summary>
+          ${d.citations.map((c) => `<div class="cite"><div class="sig">${esc(c.signal)} · ${esc(c.check_id)}${c.bug_id ? " · " + esc(c.bug_id) : ""}</div><div class="det">${esc(c.detail)}</div></div>`).join("")}
+        </details>` : ""}
+      `;
+    }
+
+    if (d.finding_details?.length) {
+      $("findingCount").textContent = d.finding_details.length;
+      $("findings").innerHTML = d.finding_details.map((f) => `
+        <div class="finding">
+          <div class="title">${esc(f.title)}</div>
+          <div class="meta"><span class="badge ${esc(f.severity)}">${esc(f.severity)}</span>${f.bug_id ? " " + esc(f.bug_id) : ""}</div>
+        </div>`).join("");
+    }
+  }
+
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const url = $("url").value.trim();
+    if (!url) return;
+
+    if (source) { source.close(); source = null; }
+    feed.innerHTML = "";
+    $("result").innerHTML = '<p class="empty">Running…</p>';
+    $("findings").innerHTML = '<p class="pad empty">No findings yet.</p>';
+    $("findingCount").textContent = "0";
+    go.disabled = true;
+    started = Date.now();
+    dot.className = "dot live"; statusText.textContent = "starting";
+
+    let streamId;
+    try {
+      const res = await fetch("/api/runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        line("err", `<span class="k-bad">Could not start</span> ${esc(err.detail || res.status)}`);
+        go.disabled = false; dot.className = "dot fail"; statusText.textContent = "error";
+        return;
+      }
+      ({ stream_id: streamId } = await res.json());
+    } catch (e) {
+      line("err", `<span class="k-bad">Could not start</span> ${esc(e.message)}`);
+      go.disabled = false; dot.className = "dot fail"; statusText.textContent = "error";
+      return;
+    }
+
+    let count = 0;
+    source = new EventSource(`/api/runs/${streamId}/events`);
+    source.onmessage = (msg) => {
+      const data = JSON.parse(msg.data);
+      if (data.type === "stream.end") {
+        source.close(); source = null;
+        go.disabled = false;
+        return;
+      }
+      count += 1;
+      $("eventCount").textContent = count;
+      narrate(data);
+      refresh(streamId);
+    };
+    source.onerror = () => {
+      if (source) { source.close(); source = null; }
+      go.disabled = false;
+      refresh(streamId);
+    };
+  });
+})();
+</script>
+</body>
+</html>

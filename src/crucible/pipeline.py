@@ -22,7 +22,7 @@ from crucible.core.events import EventBus, EventType
 from crucible.core.logging import get_logger
 from crucible.execute.client import AppClient, HttpAppClient
 from crucible.execute.runner import CheckRunner, ExecutionOutcome
-from crucible.oracle.signals import SIGNALS_BY_CHECK, SignalOutcome
+from crucible.oracle.signals import SIGNALS_BY_CHECK, SignalOutcome, reach_verdict
 from crucible.plan.synthesize import synthesize_cases
 from crucible.recon.fetcher import HttpFetcher
 from crucible.recon.scout import AppMapData, Scout
@@ -114,13 +114,18 @@ async def crawl(
     *,
     fetcher: HttpFetcher | None = None,
     max_pages: int = 40,
+    bus: EventBus | None = None,
 ) -> AppMapData:
-    """Crawl ``base_url`` and return the app map, without persisting."""
+    """Crawl ``base_url`` and return the app map, without persisting.
+
+    Pass ``bus`` to stream reconnaissance progress; a live viewer is the only
+    way to tell a slow crawl from a hung one.
+    """
     if fetcher is not None:
-        scout = Scout(base_url, fetcher, max_pages=max_pages)
+        scout = Scout(base_url, fetcher, max_pages=max_pages, bus=bus)
         return await scout.crawl()
     async with HttpFetcher() as real_fetcher:
-        scout = Scout(base_url, real_fetcher, max_pages=max_pages)
+        scout = Scout(base_url, real_fetcher, max_pages=max_pages, bus=bus)
         return await scout.crawl()
 
 
@@ -132,13 +137,14 @@ async def run_recon(
     *,
     fetcher: HttpFetcher | None = None,
     max_pages: int = 40,
+    bus: EventBus | None = None,
 ) -> tuple[str, str, AppMapData]:
     """Crawl the target and persist target, run, and app map.
 
     Returns ``(target_id, run_id, app_map)``. Pass ``fetcher`` to run against
     a canned transport (tests); otherwise a real HTTP fetcher is used.
     """
-    app_map = await crawl(base_url, fetcher=fetcher, max_pages=max_pages)
+    app_map = await crawl(base_url, fetcher=fetcher, max_pages=max_pages, bus=bus)
     target_id, run_id = persist_recon(base_url, app_map, session_factory, artifacts)
     return target_id, run_id, app_map
 
@@ -218,17 +224,23 @@ async def run_pipeline(
     fetcher: HttpFetcher | None = None,
     app_client: AppClient | None = None,
     with_benchmark: bool = True,
+    bus: EventBus | None = None,
 ) -> PipelineResult:
     """Execute the full pipeline against ``base_url``.
 
     ``fetcher`` and ``app_client`` override the real transports. Tests use
     in-memory doubles so the whole pipeline is exercisable with no network
     and no model provider.
+
+    ``bus`` lets a caller subscribe before the first event fires. A streaming
+    viewer needs that: the database run id is not known until reconnaissance
+    has already begun, so the caller's own id identifies the stream.
     """
     target_id, run_id, app_map = await run_recon(
-        base_url, settings, session_factory, artifacts, fetcher=fetcher
+        base_url, settings, session_factory, artifacts, fetcher=fetcher, bus=bus
     )
-    bus = EventBus(run_id)
+    if bus is None:
+        bus = EventBus(run_id)
     await bus.emit(EventType.RUN_STARTED, base_url=base_url)
 
     # ---- plan -------------------------------------------------------------
@@ -279,27 +291,14 @@ async def run_pipeline(
             )
             session.commit()
 
-    all_outcomes: list[SignalOutcome] = [
-        outcome for outcomes in signals_by_execution.values() for outcome in outcomes
-    ]
-    violated_any = any(o.violated is True for o in all_outcomes)
-    if violated_any:
-        aggregate = VerdictDecision.BUG
-        aggregate_confidence = max(
-            o.confidence for o in all_outcomes if o.violated is True
-        )
-    elif any(error is not None for error in error_by_execution.values()):
-        aggregate = VerdictDecision.INSUFFICIENT_EVIDENCE
-        aggregate_confidence = 0.0
-    elif any(o.violated is False for o in all_outcomes):
-        aggregate = VerdictDecision.NOT_A_BUG
-        aggregate_confidence = min(
-            (o.confidence for o in all_outcomes if o.violated is False),
-            default=0.5,
-        )
-    else:
-        aggregate = VerdictDecision.INSUFFICIENT_EVIDENCE
-        aggregate_confidence = 0.0
+    # reach_verdict is the single aggregation path, shared with the oracle's own
+    # tests. It also folds in signals that come from recon rather than from an
+    # execution; this block used to rebuild that logic by hand and silently
+    # dropped them, so a genuinely unlabelled form control never reached a
+    # finding and scored as a miss.
+    aggregate, aggregate_confidence, all_outcomes = reach_verdict(
+        [outcome.result for outcome in outcomes], app_map
+    )
     _ = decisions  # per-execution; the aggregate above is what the CLI shows
 
     await bus.emit(
