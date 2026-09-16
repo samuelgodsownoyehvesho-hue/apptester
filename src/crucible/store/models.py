@@ -319,6 +319,9 @@ class Finding(Base):
         default=FindingStatus.OPEN,
     )
     root_cause: Mapped[str | None] = mapped_column(Text, default=None)
+    #: What to change to fix it. A report nobody can act on is only half a
+    #: report, and the remedy is the part a reader looks for first.
+    suggested_fix: Mapped[str | None] = mapped_column(Text, default=None)
     repro_steps: Mapped[list[Any]] = mapped_column(JSON, default=list)
     evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     #: For the benchmark: which declared defect this corresponds to, if any.

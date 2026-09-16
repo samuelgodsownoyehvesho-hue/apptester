@@ -86,10 +86,17 @@
   dl.kv dd { margin: 0; font-family: var(--mono); }
   .empty { color: var(--muted); font-size: 13px; }
 
-  .finding { padding: 11px 15px; border-top: 1px solid var(--line); }
+  .finding { padding: 12px 15px; border-top: 1px solid var(--line); }
   .finding:first-of-type { border-top: 0; }
-  .finding .title { font-size: 13.5px; }
-  .finding .meta { color: var(--muted); font-size: 11.5px; font-family: var(--mono); margin-top: 3px; }
+  .finding .title { font-size: 14px; line-height: 1.45; }
+  .finding .meta { color: var(--muted); font-size: 11.5px; font-family: var(--mono); margin-top: 4px; }
+  .finding .blk { margin-top: 9px; font-size: 12.5px; line-height: 1.5; color: #c3c9d6; }
+  .finding .lbl {
+    display: block; color: var(--muted); font-size: 10px; letter-spacing: .09em;
+    text-transform: uppercase; margin-bottom: 2px;
+  }
+  .finding .fix { color: #8fd9bc; }
+  .finding .fix .lbl { color: #4d9e83; }
   .badge {
     display: inline-block; padding: 1px 7px; border-radius: 999px;
     font-size: 10.5px; font-family: var(--mono); border: 1px solid var(--line); color: var(--muted);
@@ -250,6 +257,9 @@
         <div class="finding">
           <div class="title">${esc(f.title)}</div>
           <div class="meta"><span class="badge ${esc(f.severity)}">${esc(f.severity)}</span>${f.bug_id ? " " + esc(f.bug_id) : ""}</div>
+          ${f.observed ? `<div class="blk"><span class="lbl">What it saw</span>${esc(f.observed)}</div>` : ""}
+          ${f.cause ? `<div class="blk"><span class="lbl">Why it happens</span>${esc(f.cause)}</div>` : ""}
+          ${f.suggested_fix ? `<div class="blk fix"><span class="lbl">How to fix it</span>${esc(f.suggested_fix)}</div>` : ""}
         </div>`).join("");
     }
   }

@@ -16,7 +16,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from crucible.benchmark.score import ScoreReport, fetch_manifest, score
+from crucible.benchmark.score import ScoreReport, fetch_manifest, reset_target, score
 from crucible.core.config import Settings
 from crucible.core.events import EventBus, EventType
 from crucible.core.logging import get_logger
@@ -274,6 +274,11 @@ async def run_pipeline(
     execution_count = 0
 
     async with (app_client if app_client is not None else HttpAppClient(base_url)) as client:
+        # Best-effort reset before probing. Without it a second run inherits the
+        # first run's cart, so the same code reports different numbers -- and
+        # can reach a different verdict -- purely because of run order.
+        await reset_target(client)
+
         with session_factory() as session:
             runner = CheckRunner(client, session, bus, run_id, app_map=app_map)
             outcomes: list[ExecutionOutcome] = await runner.run_all(case_rows)

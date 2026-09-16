@@ -63,6 +63,13 @@ def _num(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
 
+def _str_list(value: object) -> list[str] | None:
+    """A list of strings, or ``None`` when the payload is not one."""
+    if not isinstance(value, list):
+        return None
+    return [item for item in value if isinstance(item, str)]
+
+
 def signal_cart_arithmetic(result: CheckResult) -> SignalOutcome:
     """Total must equal unit_price x quantity."""
     if result.check_id != "cart_quantity_arithmetic":
@@ -236,14 +243,25 @@ def signal_search_case_equivalence(result: CheckResult) -> SignalOutcome:
         )
 
     violated = sorted(lower) != sorted(upper)
+    # Name the products, not the counts: the two casings often match the *same
+    # number* of different products, so "1 matched, 1 matched" reads like
+    # nothing is wrong to anyone who is not comparing ids by eye.
+    lower_names = _str_list(result.facts.get("lower_names"))
+    upper_names = _str_list(result.facts.get("upper_names"))
+    shown_lower = lower_names if lower_names is not None else lower
+    shown_upper = upper_names if upper_names is not None else upper
+    listed_lower = ", ".join(shown_lower) or "nothing"
+    listed_upper = ", ".join(shown_upper) or "nothing"
+
     return SignalOutcome(
         "metamorphic",
         result.check_id,
         violated,
         0.9,
-        f'"laptop" matched {len(lower)} products, "LAPTOP" matched {len(upper)}'
+        f"the same search returned different products in each casing "
+        f"(lower-case found: {listed_lower}; upper-case found: {listed_upper})"
         if violated
-        else f"both casings matched {len(lower)} products",
+        else f"both casings matched the same {len(lower)} products",
         {"lower_ids": lower, "upper_ids": upper},
         suspected_bug_id="CASE_SENSITIVE_SEARCH" if violated else None,
     )

@@ -187,7 +187,9 @@ class RunRegistry:
                 "severity": str(row.severity),
                 "status": str(row.status),
                 "bug_id": row.matched_bug_id,
-                "root_cause": row.root_cause,
+                "cause": row.root_cause,
+                "suggested_fix": row.suggested_fix,
+                "observed": (row.evidence or {}).get("observed"),
             }
             for row in rows
         ]

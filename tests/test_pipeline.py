@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
-from crucible.benchmark.score import Manifest, fetch_manifest, score
+from crucible.benchmark.score import Manifest, fetch_manifest, reset_target, score
 from crucible.core.config import Settings
 from crucible.execute.checks import CheckResult
 from crucible.execute.client import ApiResponse, AppClient
@@ -272,6 +272,96 @@ async def test_recon_derived_signal_reaches_findings(
     assert result.benchmark.true_positives == ["UNLABELED_CHECKOUT_INPUT"]
     assert result.benchmark.recall == pytest.approx(1.0)
     assert result.benchmark.precision == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_findings_explain_themselves_to_a_non_author(
+    db: sessionmaker[Session], artifacts: ArtifactStore
+) -> None:
+    """Every finding must say what broke and what to change.
+
+    Regression guard: findings used to read "<BUG_ID>: <check name>
+    contradicts the declared invariant", which tells the person who has to fix
+    it nothing at all.
+    """
+    fake = FakeGuineaPig(simulate=BUGGED)
+    result = await run_pipeline(
+        "http://guinea.test",
+        _settings(),
+        db,
+        artifacts,
+        fetcher=StaticSiteFetcher(),
+        app_client=fake,
+    )
+
+    with db() as session:
+        rows = session.query(Finding).filter(Finding.run_id == result.run_id).all()
+
+    assert rows
+    for row in rows:
+        assert row.title, row.matched_bug_id
+        assert row.root_cause, f"{row.matched_bug_id} explains no cause"
+        assert row.suggested_fix, f"{row.matched_bug_id} suggests no fix"
+
+        # Oracle vocabulary must not reach a human-facing report.
+        prose = row.title.lower()
+        for banned in ("invariant", "contradicts", "signal:", "check_id"):
+            assert banned not in prose, f"jargon {banned!r} in {row.title!r}"
+
+    titles = {row.matched_bug_id: row.title for row in rows}
+    assert titles["CART_QTY_IGNORED"] == (
+        "The cart charges for one item when you order several"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reset_is_optional_for_targets_that_lack_it() -> None:
+    """A target with no reset endpoint must not fail the run."""
+    client = MapOnlyClient()
+    assert await reset_target(client) is False
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_run_does_not_inherit_the_previous_runs_state(
+    db: sessionmaker[Session], artifacts: ArtifactStore
+) -> None:
+    """Two runs against the same target must report the same numbers.
+
+    Regression: nothing ever called the target's own reset, so a cart left
+    behind by an earlier run changed the figures a later run reported and the
+    same code could reach a different verdict purely because of run order.
+    """
+    fake = FakeGuineaPig(simulate={"CART_QTY_IGNORED", "DISCOUNT_STACKS"})
+
+    # Dirty the target the way a previous run would have left it: a leftover
+    # line, and a discount compounded by being applied twice.
+    await fake.post(
+        "/api/cart",
+        {"productId": "leftover", "name": "Leftover", "price": 7.50, "quantity": 4},
+    )
+    await fake.post("/api/cart/discount", {"code": "SAVE10"})
+    await fake.post("/api/cart/discount", {"code": "SAVE10"})
+    assert fake.discount_rate > 0.1, "precondition: the target starts dirty"
+
+    result = await run_pipeline(
+        "http://guinea.test",
+        _settings(),
+        db,
+        artifacts,
+        fetcher=StaticSiteFetcher(),
+        app_client=fake,
+    )
+
+    arithmetic = next(
+        outcome
+        for outcome in result.outcomes
+        if outcome.check_id == "cart_quantity_arithmetic" and outcome.violated is True
+    )
+    # 2 x $10.00 with a clean discount rate: the unit-price defect reports the
+    # unit price exactly. A leaked discount would have shown less than $10.00.
+    assert arithmetic.evidence["expected_total"] == pytest.approx(20.0)
+    assert arithmetic.evidence["reported_total"] == pytest.approx(10.0)
 
 
 def test_score_flags_label_without_violated_signal() -> None:

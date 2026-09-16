@@ -206,11 +206,19 @@ async def check_search_case_equivalence(client: AppClient) -> CheckResult:
             lower.error or upper.error,
         )
 
-    def ids(response: object) -> list[str]:
+    def items_of(response: object) -> list[dict[str, Any]]:
         if isinstance(response, dict):
             items = response.get("items", [])
-            return [str(i.get("id")) for i in items if isinstance(i, dict)]
+            return [i for i in items if isinstance(i, dict)]
         return []
+
+    def ids(response: object) -> list[str]:
+        return [str(item.get("id")) for item in items_of(response)]
+
+    # Product names are captured alongside the ids purely so a reader gets
+    # "laptop stand" rather than "p-03" in the report.
+    def names(response: object) -> list[str]:
+        return [str(item.get("name")) for item in items_of(response)]
 
     return CheckResult(
         check_id,
@@ -220,6 +228,8 @@ async def check_search_case_equivalence(client: AppClient) -> CheckResult:
             "invariant": 'search("laptop") returns the same set as search("LAPTOP")',
             "lower_ids": ids(lower.json_body),
             "upper_ids": ids(upper.json_body),
+            "lower_names": names(lower.json_body),
+            "upper_names": names(upper.json_body),
         },
     )
 

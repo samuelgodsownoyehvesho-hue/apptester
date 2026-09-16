@@ -22,12 +22,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from crucible.core.logging import get_logger
 from crucible.execute.client import AppClient
 from crucible.oracle.signals import SignalOutcome
 from crucible.store.models import Finding
 from crucible.triage.cluster import cluster
 
+logger = get_logger(__name__)
+
 BENCHMARK_MANIFEST_PATH = "/api/ground-truth/bugs"
+#: A target that offers its ground truth may also offer to clear its state.
+RESET_PATH = "/api/ground-truth/reset"
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +88,29 @@ class ScoreReport:
             "true_positives": self.true_positives,
             "false_positives": self.false_positives,
         }
+
+
+async def reset_target(client: AppClient) -> bool:
+    """Ask the target to clear its state, if it offers to.
+
+    Isolation between runs is the difference between a reproducible number and
+    one that depends on how many times the tool has been run today: a cart that
+    accumulated a compounded discount last time changes this run's arithmetic
+    and can change its verdict. Not every target can offer this, so an absent
+    endpoint is normal rather than a failure.
+
+    Returns whether a reset actually happened -- a caller that needs clean
+    state must check, not assume.
+    """
+    response = await client.post(RESET_PATH, {})
+    if response.error is not None or not response.ok:
+        logger.debug(
+            "target_reset_unavailable status=%s error=%s",
+            response.status,
+            response.error,
+        )
+        return False
+    return True
 
 
 async def fetch_manifest(client: AppClient) -> Manifest:

@@ -114,6 +114,11 @@ class FakeGuineaPig:
         return ApiResponse(status=404, text="not found")
 
     async def post(self, path: str, json_body: Any) -> ApiResponse:
+        if path == "/api/ground-truth/reset":
+            self.lines = []
+            self.discount_rate = 0.0
+            self.stale_totals = None
+            return self._json({"ok": True, "cart": self._cart()})
         if path == "/api/cart":
             quantity = json_body.get("quantity", 1)
             if "CHECKOUT_ACCEPTS_NEGATIVE_QTY" not in self.simulate and (

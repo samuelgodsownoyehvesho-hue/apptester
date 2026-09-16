@@ -38,6 +38,8 @@ class FindingDraft:
     root_cause: str
     evidence: dict[str, Any]
     suspected_bug_id: str | None
+    #: What to change to fix it, when the check has a known remedy.
+    suggested_fix: str | None = None
 
 
 #: Signal -> severity. The oracle speaks in invariants; severity is a triage
@@ -49,17 +51,126 @@ SEVERITY_BY_SIGNAL: dict[str, Severity] = {
     "accessibility": Severity.MEDIUM,
 }
 
-#: A per-check fallback title when a signal contributes to a shared finding.
-_CHECK_LABEL: dict[str, str] = {
-    "cart_quantity_arithmetic": "cart quantity arithmetic",
-    "empty_cart_reset": "empty-cart total reset",
-    "discount_idempotence": "discount code idempotence",
-    "price_sort_monotonic": "price sort ordering",
-    "search_case_equivalence": "search case equivalence",
-    "pagination_disjoint": "pagination disjointness",
-    "negative_quantity_rejected": "negative quantity rejection",
-    "referenced_routes_respond": "linked route availability",
-    "app_map_controls": "accessible names on form controls",
+@dataclass(frozen=True, slots=True)
+class Narrative:
+    """How one kind of violation is explained to a person.
+
+    Deliberately here rather than in the oracle. The oracle decides *whether*
+    an invariant broke, which is a judgement about the application; how to
+    phrase that for a human, and what to do about it, is presentation. It
+    changes with audience and never with evidence, and keeping it in one table
+    means nobody has to read nine signal functions to find out what a report
+    will say.
+
+    ``summary`` avoids the words "invariant" and "assert". A report that only
+    a test author can read is a report nobody acts on.
+    """
+
+    #: What a user would actually see, in one sentence.
+    summary: str
+    #: Why the application behaves this way.
+    cause: str
+    #: What to change to fix it.
+    fix: str
+
+
+#: One narrative per check, keyed by check id. A check with no entry still
+#: produces a finding; it just falls back to the raw evidence.
+_NARRATIVE: dict[str, Narrative] = {
+    "cart_quantity_arithmetic": Narrative(
+        summary="The cart charges for one item when you order several",
+        cause=(
+            "The line total uses the unit price on its own instead of "
+            "multiplying it by the quantity ordered."
+        ),
+        fix=(
+            "Multiply unit price by quantity for each cart line, then add "
+            "those line totals up to get the subtotal."
+        ),
+    ),
+    "empty_cart_reset": Narrative(
+        summary="An emptied cart still shows the total from before the items were removed",
+        cause=(
+            "Removing the last item clears the list of lines but never "
+            "recalculates the totals, so the previous figures are left behind."
+        ),
+        fix=(
+            "Recalculate subtotal, discount and total after every change to "
+            "the cart lines, including when the last one is removed."
+        ),
+    ),
+    "discount_idempotence": Narrative(
+        summary="A discount code keeps working when applied a second time",
+        cause=(
+            "Each application compounds onto the existing discount instead of "
+            "replacing it, so the price falls further every time someone "
+            "presses Apply."
+        ),
+        fix=(
+            "Treat the code as setting a discount rate rather than adding to "
+            "one, so applying it twice leaves the price unchanged."
+        ),
+    ),
+    "price_sort_monotonic": Narrative(
+        summary='Sorting by "Price: low to high" puts items in the wrong order',
+        cause=(
+            "Prices are compared as text rather than as numbers, so 19.99 "
+            "sorts after 149.99 because the character '1' comes before '9'."
+        ),
+        fix="Compare prices as numbers in the catalogue sort, not as strings.",
+    ),
+    "search_case_equivalence": Narrative(
+        summary="Search returns different results depending on capitalisation",
+        cause=(
+            "The search compares the raw text, so a term only matches when the "
+            "capitalisation happens to line up with the product name."
+        ),
+        fix="Lowercase both the search term and the product name before comparing them.",
+    ),
+    "pagination_disjoint": Narrative(
+        summary="The same product appears on two pages of the catalogue at once",
+        cause=(
+            "Each page's starting position is one item too early, so "
+            "consecutive pages overlap: one product is listed twice while "
+            "another is never shown at all."
+        ),
+        fix=(
+            "Start each page at (page number - 1) x items per page, with no "
+            "extra adjustment."
+        ),
+    ),
+    "negative_quantity_rejected": Narrative(
+        summary="The cart accepts a negative quantity",
+        cause=(
+            "The add-to-cart endpoint stores whatever quantity it is sent "
+            "without validating it, so a request for -1 is accepted and then "
+            "pulls the total down."
+        ),
+        fix="Reject any quantity below 1 with a 400 response before touching the cart.",
+    ),
+    "referenced_routes_respond": Narrative(
+        summary="Links in the page footer lead to pages that do not exist",
+        cause=(
+            "The footer links to routes that were never built, so following "
+            "them ends in a 'page not found' error."
+        ),
+        fix=(
+            "Either build the missing pages or remove the links from the "
+            "navigation so they cannot be followed."
+        ),
+    ),
+    "app_map_controls": Narrative(
+        summary="The checkout email field has no label, so screen readers cannot say what it is for",
+        cause=(
+            "The field relies on placeholder text. A placeholder is a hint, "
+            "not a label: it is not announced as the field's name and it "
+            "disappears as soon as typing starts."
+        ),
+        fix=(
+            "Give the input a real <label> tied to it by id, or an aria-label, "
+            "that stays present and is announced."
+        ),
+    ),
 }
 
 
@@ -76,22 +187,29 @@ def cluster(outcomes: list[SignalOutcome]) -> list[FindingDraft]:
     for key, group in sorted(by_key.items()):
         primary = max(group, key=lambda outcome: outcome.confidence)
         severity = SEVERITY_BY_SIGNAL.get(primary.signal, Severity.MEDIUM)
-        label = _CHECK_LABEL.get(primary.check_id, primary.check_id)
+        narrative = _NARRATIVE.get(primary.check_id)
 
-        if key.startswith("signal:"):
-            title = f"Invariant violated: {label}"
-        else:
-            title = f"{key}: {label} contradicts the declared invariant"
+        # The narrative describes the *kind* of defect; the primary signal's
+        # detail carries the numbers this run actually observed, so a reader
+        # gets both the explanation and the evidence for it.
+        title = (
+            narrative.summary
+            if narrative is not None
+            else f"Unexpected behaviour in {primary.check_id}: {primary.detail}"
+        )
+        root_cause = narrative.cause if narrative is not None else primary.detail
 
         drafts.append(
             FindingDraft(
                 key=key,
                 title=title,
                 severity=severity,
-                root_cause=primary.detail,
+                root_cause=root_cause,
+                suggested_fix=narrative.fix if narrative is not None else None,
                 evidence={
                     "signals": [outcome.as_dict() for outcome in group],
                     "primary_signal": primary.signal,
+                    "observed": primary.detail,
                 },
                 suspected_bug_id=None if key.startswith("signal:") else key,
             )
@@ -114,7 +232,8 @@ async def write_findings(
             severity=draft.severity,
             status=FindingStatus.OPEN,
             root_cause=draft.root_cause,
-            repro_steps=[draft.root_cause],
+            suggested_fix=draft.suggested_fix,
+            repro_steps=[draft.evidence.get("observed", draft.root_cause)],
             evidence=draft.evidence,
             matched_bug_id=draft.suspected_bug_id,
         )
