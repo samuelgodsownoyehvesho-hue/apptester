@@ -21,6 +21,7 @@ violation scores as a false positive regardless of the label.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from typing import Any
 
 from crucible.execute.checks import CheckResult
@@ -101,24 +102,61 @@ def signal_cart_arithmetic(result: CheckResult) -> SignalOutcome:
     )
 
 
-def signal_truncated_rounding(result: CheckResult) -> SignalOutcome:
-    """A discounted total that loses fractions of a cent indicates truncation.
+def signal_rounding_precision(result: CheckResult) -> SignalOutcome:
+    """A discounted total must be rounded to the nearest cent, not cut off.
 
-    Reading this off the same add-to-cart probe: 3 x $19.99 with no discount
-    is $59.97 either way, so this signal only speaks when it can compute a
-    total with a non-trivial third decimal. It stays silent otherwise — an
-    under-powered signal must not borrow confidence from a sibling.
+    The comparison redoes the arithmetic in exact decimal rather than binary
+    floating point, so the only question it answers is "did this round?" and
+    never "is the subtotal right?" -- separate defects with separate causes,
+    and conflating them would make each impossible to trace.
     """
-    if result.check_id != "cart_quantity_arithmetic":
+    if result.check_id != "rounding_precision":
         return SignalOutcome("arithmetic", result.check_id, None, 0.0, "not applicable")
 
+    subtotal = _num(result.facts.get("subtotal"))
+    rate = _num(result.facts.get("discount_rate"))
     reported = _num(result.facts.get("reported_total"))
-    if reported is None:
-        return SignalOutcome("arithmetic", result.check_id, None, 0.0, "no total")
+    if subtotal is None or rate is None or reported is None:
+        return SignalOutcome(
+            "arithmetic", result.check_id, None, 0.0,
+            "money fields missing; evidence unusable", {"facts": result.facts},
+        )
 
-    # 3 x $19.99 = $59.97 exactly; truncation of the *product* of a discount
-    # would show, but this probe carries no discount. No opinion.
-    return SignalOutcome("arithmetic", result.check_id, None, 0.0, "probe lacks a discount step")
+    exact = Decimal(str(subtotal)) * (Decimal(1) - Decimal(str(rate)))
+    cent = Decimal("0.01")
+    rounded = exact.quantize(cent, rounding=ROUND_HALF_UP)
+    truncated = exact.quantize(cent, rounding=ROUND_DOWN)
+
+    if rounded == truncated:
+        # The probe only discriminates when the two disagree. Staying silent is
+        # the honest answer: claiming "no violation" would assert something the
+        # evidence cannot show.
+        return SignalOutcome(
+            "arithmetic", result.check_id, None, 0.0,
+            f"${exact:.4f} rounds and truncates to the same cent, so this probe "
+            "cannot tell them apart",
+            {"exact": str(exact), "expected": str(rounded)},
+        )
+
+    violated = abs(Decimal(str(reported)) - rounded) > Decimal("0.004")
+    return SignalOutcome(
+        "arithmetic",
+        result.check_id,
+        violated,
+        0.95,
+        f"${exact:.4f} should round to ${rounded}, but the app reported "
+        f"${reported:.2f}"
+        if violated
+        else f"${exact:.4f} rounded to ${rounded} correctly",
+        {
+            "subtotal": subtotal,
+            "discount_rate": rate,
+            "exact_total": str(exact),
+            "expected_total": str(rounded),
+            "reported_total": reported,
+        },
+        suspected_bug_id="TRUNCATED_ROUNDING" if violated else None,
+    )
 
 
 # -------------------------------------------------------------- metamorphic
@@ -406,7 +444,8 @@ def signal_unlabelled_controls(app_map: AppMapData | None) -> SignalOutcome:
 
 #: Per-check signal mapping, in the order signals contribute to a verdict.
 SIGNALS_BY_CHECK: dict[str, tuple[Any, ...]] = {
-    "cart_quantity_arithmetic": (signal_cart_arithmetic, signal_truncated_rounding),
+    "cart_quantity_arithmetic": (signal_cart_arithmetic,),
+    "rounding_precision": (signal_rounding_precision,),
     "empty_cart_reset": (signal_empty_cart_reset,),
     "discount_idempotence": (signal_discount_idempotence,),
     "price_sort_monotonic": (signal_price_monotonic,),

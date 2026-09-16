@@ -117,3 +117,30 @@ class HttpAppClient:
 
     async def __aexit__(self, *_exc: object) -> None:
         await self.aclose()
+
+
+#: A target that offers its ground truth may also offer to clear its state.
+RESET_PATH = "/api/ground-truth/reset"
+
+
+async def reset_target(client: AppClient) -> bool:
+    """Ask the target to clear its state, if it offers to.
+
+    Isolation is the difference between a reproducible number and one that
+    depends on how many times the tool has been run: a cart that accumulated a
+    compounded discount changes the arithmetic a later probe reports, and can
+    change its verdict. Not every target can offer this, so an absent endpoint
+    is normal rather than a failure.
+
+    Returns whether a reset happened -- a caller that needs clean state must
+    check rather than assume.
+    """
+    response = await client.post(RESET_PATH, {})
+    if response.error is not None or not response.ok:
+        logger.debug(
+            "target_reset_unavailable status=%s error=%s",
+            response.status,
+            response.error,
+        )
+        return False
+    return True

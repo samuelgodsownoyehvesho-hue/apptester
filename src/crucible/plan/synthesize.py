@@ -71,6 +71,11 @@ def synthesize_cases(app_map: AppMapData | None) -> list[PlannedCase]:
         "Cart total equals the sum of unit price times quantity",
         "arithmetic",
     )
+    add(
+        "rounding_precision",
+        "A discounted total rounds to the nearest cent instead of being cut off",
+        "arithmetic",
+    )
     add("empty_cart_reset", "Emptying the cart resets the total to zero", "metamorphic")
     add("discount_idempotence", "Applying one discount code twice changes nothing", "metamorphic")
     add(

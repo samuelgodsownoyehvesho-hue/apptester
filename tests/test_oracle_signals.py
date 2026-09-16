@@ -50,16 +50,48 @@ class TestCartArithmetic:
         assert outcome.violated is None
         assert outcome.confidence == 0.0
 
-    def test_second_signal_has_no_opinion(self) -> None:
-        result = CheckResult(
-            check_id="cart_quantity_arithmetic",
-            lane="arithmetic",
-            observation="",
-            facts={"expected_total": 20.0, "reported_total": 20.0},
+    def test_rounding_is_not_read_off_the_quantity_probe(self) -> None:
+        """Rounding has its own probe, because this one has no discount.
+
+        The quantity probe adds 2 x $10.00, which is exact either way. A
+        rounding signal attached here could only ever stay silent, which is how
+        the truncation defect went undetected while looking covered.
+        """
+        assert len(SIGNALS_BY_CHECK["cart_quantity_arithmetic"]) == 1
+        assert len(SIGNALS_BY_CHECK["rounding_precision"]) == 1
+
+
+class TestRoundingPrecision:
+    def test_holds_when_rounded(self) -> None:
+        # $1.07 less 20% is $0.85600, which rounds to $0.86.
+        outcome = _run(
+            "rounding_precision",
+            {"subtotal": 1.07, "discount_rate": 0.2, "reported_total": 0.86},
         )
-        outcomes = [signal(result) for signal in SIGNALS_BY_CHECK["cart_quantity_arithmetic"]]
-        assert len(outcomes) == 2
-        assert outcomes[1].violated is None  # truncated-rounding signal stays silent
+        assert outcome.violated is False
+        assert outcome.suspected_bug_id is None
+
+    def test_violated_when_truncated(self) -> None:
+        outcome = _run(
+            "rounding_precision",
+            {"subtotal": 1.07, "discount_rate": 0.2, "reported_total": 0.85},
+        )
+        assert outcome.violated is True
+        assert outcome.suspected_bug_id == "TRUNCATED_ROUNDING"
+
+    def test_no_opinion_when_the_two_agree(self) -> None:
+        # No discount: 1.07 rounds and truncates identically, so the probe has
+        # nothing to say and must not claim the invariant held.
+        outcome = _run(
+            "rounding_precision",
+            {"subtotal": 1.07, "discount_rate": 0.0, "reported_total": 1.07},
+        )
+        assert outcome.violated is None
+        assert outcome.confidence == 0.0
+
+    def test_no_opinion_when_money_fields_are_missing(self) -> None:
+        outcome = _run("rounding_precision", {"subtotal": 1.07})
+        assert outcome.violated is None
 
 
 class TestEmptyCartReset:

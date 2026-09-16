@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from crucible.core.logging import get_logger
-from crucible.execute.client import AppClient
+from crucible.execute.client import AppClient, reset_target
 from crucible.recon.scout import AppMapData
 
 logger = get_logger(__name__)
@@ -54,7 +54,17 @@ class CheckResult:
 
 
 async def _empty_cart(client: AppClient) -> None:
-    """Best-effort cart reset between checks."""
+    """Return the cart to a known state before a check probes it.
+
+    Prefers the target's own reset because clearing the lines is not enough:
+    every check shares one cart, so a discount left behind by the rounding or
+    discount probe changes the figures the next probe reports. The invariant
+    still detects the defect either way, but the numbers in the report stop
+    making sense to anyone reading them.
+    """
+    if await reset_target(client):
+        return
+
     snapshot = await client.get("/api/cart")
     lines: list[dict[str, Any]] = []
     if snapshot.is_json and isinstance(snapshot.json_body, dict):
@@ -94,6 +104,54 @@ async def check_cart_quantity_arithmetic(client: AppClient) -> CheckResult:
             "reported_total": cart.get("total"),
             "reported_subtotal": cart.get("subtotal"),
             "lines": cart.get("lines", []),
+        },
+    )
+
+
+async def check_rounding_precision(client: AppClient) -> CheckResult:
+    """Apply a discount that leaves a fraction of a cent on the total.
+
+    $1.07 less 20% is $0.85600. Rounding to the nearest cent gives $0.86;
+    dropping the third digit gives $0.85. The two disagree, which is the only
+    way to tell which one the application does. A probe without a discount
+    produces an exact result either way and can never answer the question --
+    which is why the previous attempt at this check could only stay silent.
+    """
+    check_id = "rounding_precision"
+    await _empty_cart(client)
+
+    added = await client.post(
+        "/api/cart",
+        {"productId": "probe-4", "name": "Probe Item", "price": 1.07, "quantity": 1},
+    )
+    if added.error or not added.is_json:
+        return CheckResult(check_id, "arithmetic", "cart add failed", {}, added.error)
+
+    discounted = await client.post("/api/cart/discount", {"code": "SAVE20"})
+    if discounted.error or not discounted.is_json:
+        return CheckResult(check_id, "arithmetic", "discount failed", {}, discounted.error)
+
+    body = discounted.json_body if isinstance(discounted.json_body, dict) else {}
+    cart = body.get("cart", body)
+    await _empty_cart(client)
+
+    return CheckResult(
+        check_id,
+        "arithmetic",
+        "applied a discount leaving a fraction of a cent",
+        {
+            "invariant": (
+                "a total is rounded to the nearest cent, not cut off at the "
+                "third decimal"
+            ),
+            "unit_price": 1.07,
+            "discount_code": "SAVE20",
+            # The expectation is derived from what the server *reported*, not
+            # from what we asked for, so a wrong subtotal elsewhere cannot be
+            # mistaken for a rounding defect.
+            "subtotal": cart.get("subtotal"),
+            "discount_rate": cart.get("discountRate"),
+            "reported_total": cart.get("total"),
         },
     )
 
@@ -334,6 +392,7 @@ async def check_referenced_routes_respond(
 #: that depend on a clean cart.
 CHECK_REGISTRY: dict[str, Any] = {
     "cart_quantity_arithmetic": check_cart_quantity_arithmetic,
+    "rounding_precision": check_rounding_precision,
     "empty_cart_reset": check_empty_cart_reset,
     "discount_idempotence": check_discount_idempotence,
     "price_sort_monotonic": check_price_sort_monotonic,

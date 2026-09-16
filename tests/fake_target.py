@@ -10,9 +10,22 @@ oracle is allowed to see.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from crucible.execute.client import ApiResponse
+
+#: Mirrors the app's DISCOUNT_CODES, keyed by the code the caller sends.
+DISCOUNT_CODES: dict[str, float] = {"SAVE10": 0.1, "SAVE20": 0.2, "HALFOFF": 0.5}
+
+
+def _round2(value: float) -> float:
+    """Half-up to two decimals, matching JavaScript's Math.round.
+
+    Python's built-in round() is banker's rounding, which would disagree with
+    the application on exact halves and make the twin an unfaithful oracle.
+    """
+    return math.floor(value * 100 + 0.5) / 100
 
 
 class FakeGuineaPig:
@@ -30,20 +43,20 @@ class FakeGuineaPig:
     # -- helpers -------------------------------------------------------
 
     def _fresh_cart(self) -> dict[str, Any]:
-        subtotal = round(
-            sum(float(line["price"]) * int(line["quantity"]) for line in self.lines), 2
+        subtotal = _round2(
+            sum(float(line["price"]) * int(line["quantity"]) for line in self.lines)
         )
         if "CART_QTY_IGNORED" in self.simulate:
-            subtotal = round(sum(float(line["price"]) for line in self.lines), 2)
+            subtotal = _round2(sum(float(line["price"]) for line in self.lines))
         raw = subtotal * (1 - self.discount_rate)
         truncate = "TRUNCATED_ROUNDING" in self.simulate
-        total = int(raw * 100) / 100 if truncate else round(raw, 2)
+        total = math.trunc(raw * 100) / 100 if truncate else _round2(raw)
         return {
             "lines": [dict(line) for line in self.lines],
             "appliedCodes": ["SAVE10"] if self.discount_rate else [],
             "discountRate": self.discount_rate,
             "subtotal": subtotal,
-            "discount": round(subtotal * self.discount_rate, 2),
+            "discount": _round2(subtotal * self.discount_rate),
             "total": total,
         }
 
@@ -138,12 +151,15 @@ class FakeGuineaPig:
             return self._json({"ok": True, "cart": self._cart()}, 201)
         if path == "/api/cart/discount":
             code = str(json_body.get("code", "")).upper()
-            if code != "SAVE10":
+            rate = DISCOUNT_CODES.get(code)
+            if rate is None:
                 return self._json({"ok": False, "error": "unknown code"}, 400)
             if "DISCOUNT_STACKS" in self.simulate:
-                self.discount_rate = round(1 - (1 - self.discount_rate) * 0.9, 6)
+                self.discount_rate = round(
+                    1 - (1 - self.discount_rate) * (1 - rate), 6
+                )
             else:
-                self.discount_rate = max(self.discount_rate, 0.1)
+                self.discount_rate = max(self.discount_rate, rate)
             self.stale_totals = None
             return self._json({"ok": True, "cart": self._cart()})
         return ApiResponse(status=404, text="not found")

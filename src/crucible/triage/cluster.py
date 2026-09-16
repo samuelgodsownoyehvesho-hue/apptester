@@ -88,6 +88,18 @@ _NARRATIVE: dict[str, Narrative] = {
             "those line totals up to get the subtotal."
         ),
     ),
+    "rounding_precision": Narrative(
+        summary="Money is cut off instead of rounded, so the shop loses a cent on some totals",
+        cause=(
+            "The final total drops the third decimal rather than rounding it, "
+            "so any amount whose third decimal is 5 or more is charged one "
+            "cent less than it should be."
+        ),
+        fix=(
+            "Round the total to the nearest cent rather than truncating it, "
+            "and round once at the end instead of on each intermediate step."
+        ),
+    ),
     "empty_cart_reset": Narrative(
         summary="An emptied cart still shows the total from before the items were removed",
         cause=(

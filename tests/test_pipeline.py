@@ -16,10 +16,10 @@ from typing import Any
 import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
-from crucible.benchmark.score import Manifest, fetch_manifest, reset_target, score
+from crucible.benchmark.score import Manifest, fetch_manifest, score
 from crucible.core.config import Settings
 from crucible.execute.checks import CheckResult
-from crucible.execute.client import ApiResponse, AppClient
+from crucible.execute.client import ApiResponse, AppClient, reset_target
 from crucible.pipeline import run_pipeline
 from crucible.recon.fetcher import FetchResult, HttpFetcher
 from crucible.store.artifacts import ArtifactStore
@@ -30,6 +30,7 @@ from tests.fake_target import FakeGuineaPig
 
 BUGGED = {
     "CART_QTY_IGNORED",
+    "TRUNCATED_ROUNDING",
     "EMPTY_CART_STALE_TOTAL",
     "DISCOUNT_STACKS",
     "LEXICOGRAPHIC_SORT",
@@ -142,8 +143,9 @@ async def test_buggy_target_is_scored_as_buggy(
     assert result.benchmark is not None
     report = result.benchmark
 
-    # The 8 simulated defects are exactly the ones reachable without a
-    # browser; the 2 others (accessibility, truncation) are not.
+    # These 9 are reachable without a browser. The tenth, an unlabelled form
+    # control, needs markup that recon has to observe -- and this canned site
+    # serves no forms, so it is covered by its own test instead.
     assert sorted(report.true_positives) == sorted(BUGGED)
     assert report.false_positives == []
     assert report.recall == pytest.approx(1.0)

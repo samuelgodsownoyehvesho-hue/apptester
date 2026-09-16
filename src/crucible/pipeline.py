@@ -16,11 +16,11 @@ from typing import Any
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from crucible.benchmark.score import ScoreReport, fetch_manifest, reset_target, score
+from crucible.benchmark.score import ScoreReport, fetch_manifest, score
 from crucible.core.config import Settings
 from crucible.core.events import EventBus, EventType
 from crucible.core.logging import get_logger
-from crucible.execute.client import AppClient, HttpAppClient
+from crucible.execute.client import AppClient, HttpAppClient, reset_target
 from crucible.execute.runner import CheckRunner, ExecutionOutcome
 from crucible.oracle.signals import SIGNALS_BY_CHECK, SignalOutcome, reach_verdict
 from crucible.plan.synthesize import synthesize_cases
