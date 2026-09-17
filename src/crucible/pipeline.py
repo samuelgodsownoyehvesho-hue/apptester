@@ -263,6 +263,11 @@ async def run_pipeline(
         chat_log_path = artifacts.root / run_id / "conversation.json"
         channel = ChatChannel(bus, log_path=chat_log_path)
 
+    await channel.inform(
+        f"I'm exploring the site. Found {len(app_map.routes)} pages, "
+        f"{len(app_map.forms)} forms so far."
+    )
+
     # ---- plan -------------------------------------------------------------
     await bus.emit(EventType.PLAN_STARTED)
     planned = synthesize_cases(app_map)
@@ -299,25 +304,30 @@ async def run_pipeline(
         # can reach a different verdict -- purely because of run order.
         await reset_target(client)
 
-        with session_factory() as session:
-            runner = CheckRunner(
-                client, session, bus, run_id,
-                app_map=app_map, questioner=channel,
-            )
-            outcomes: list[ExecutionOutcome] = await runner.run_all(case_rows)
-            for execution_outcome in outcomes:
-                execution_count += 1
-                error_by_execution[execution_outcome.execution_id] = (
-                    execution_outcome.result.error
-                )
-                signals_by_execution[execution_outcome.execution_id] = _derive_signals(
-                    execution_outcome
-                )
+    await channel.inform(
+        f"Planning complete. I'm going to run {len(planned)} checks "
+        f"to look for bugs."
+    )
 
-            decisions = _persist_verdicts(
-                session, signals_by_execution, error_by_execution
+    with session_factory() as session:
+        runner = CheckRunner(
+            client, session, bus, run_id,
+            app_map=app_map, questioner=channel,
+        )
+        outcomes: list[ExecutionOutcome] = await runner.run_all(case_rows)
+        for execution_outcome in outcomes:
+            execution_count += 1
+            error_by_execution[execution_outcome.execution_id] = (
+                execution_outcome.result.error
             )
-            session.commit()
+            signals_by_execution[execution_outcome.execution_id] = _derive_signals(
+                execution_outcome
+            )
+
+        decisions = _persist_verdicts(
+            session, signals_by_execution, error_by_execution
+        )
+        session.commit()
 
     # reach_verdict is the single aggregation path, shared with the oracle's own
     # tests. It also folds in signals that come from recon rather than from an
@@ -336,6 +346,12 @@ async def run_pipeline(
     )
 
     # ---- browser walk -----------------------------------------------------
+    await channel.inform(
+        f"Checks done. Found {aggregate_confidence:.0%} confidence "
+        f"in the verdict. Now opening a real browser to record what the "
+        f"site looks like to a visitor."
+    )
+
     browser_recording: BrowserRecording | None = None
     if with_browser:
         # This lane is optional in a way the others are not: it needs a real
@@ -357,6 +373,11 @@ async def run_pipeline(
             )
 
     # ---- triage -----------------------------------------------------------
+    await channel.inform(
+        "Browser recording done. Now grouping findings and checking "
+        "accuracy against known defects."
+    )
+
     with session_factory() as session:
         findings: list[Finding] = await write_findings(run_id, all_outcomes, bus)
         session.add_all(findings)
@@ -383,6 +404,18 @@ async def run_pipeline(
 
     # Persist the conversation log so it can be replayed later.
     channel.save()
+
+    if benchmark_report:
+        await channel.inform(
+            f"Scan complete! Found {len(findings)} bugs. "
+            f"Accuracy: {benchmark_report.recall:.0%} of known defects found, "
+            f"{benchmark_report.precision:.0%} precision (no false alarms)."
+        )
+    else:
+        await channel.inform(
+            f"Scan complete! Found {len(findings)} issue(s) "
+            f"across {len(app_map.routes)} pages."
+        )
 
     with session_factory() as session:
         run_row = session.get(Run, run_id)
