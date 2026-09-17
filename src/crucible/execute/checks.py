@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from crucible.core.logging import get_logger
+from crucible.core.qa import ChatChannel
 from crucible.execute.client import AppClient, reset_target
 from crucible.recon.scout import AppMapData
 
@@ -78,7 +79,7 @@ async def _empty_cart(client: AppClient) -> None:
 # ------------------------------------------------------------------- checks
 
 
-async def check_cart_quantity_arithmetic(client: AppClient) -> CheckResult:
+async def check_cart_quantity_arithmetic(client: AppClient, questioner: ChatChannel | None = None) -> CheckResult:
     """Add 2 units of a $10.00 item and record the reported total."""
     check_id = "cart_quantity_arithmetic"
     await _empty_cart(client)
@@ -108,7 +109,7 @@ async def check_cart_quantity_arithmetic(client: AppClient) -> CheckResult:
     )
 
 
-async def check_rounding_precision(client: AppClient) -> CheckResult:
+async def check_rounding_precision(client: AppClient, questioner: ChatChannel | None = None) -> CheckResult:
     """Apply a discount that leaves a fraction of a cent on the total.
 
     $1.07 less 20% is $0.85600. Rounding to the nearest cent gives $0.86;
@@ -156,7 +157,7 @@ async def check_rounding_precision(client: AppClient) -> CheckResult:
     )
 
 
-async def check_empty_cart_reset(client: AppClient) -> CheckResult:
+async def check_empty_cart_reset(client: AppClient, questioner: ChatChannel | None = None) -> CheckResult:
     """Add an item, remove it, and read the total again."""
     check_id = "empty_cart_reset"
     await _empty_cart(client)
@@ -187,7 +188,7 @@ async def check_empty_cart_reset(client: AppClient) -> CheckResult:
     )
 
 
-async def check_discount_idempotence(client: AppClient) -> CheckResult:
+async def check_discount_idempotence(client: AppClient, questioner: ChatChannel | None = None) -> CheckResult:
     """Apply SAVE10 twice; idempotence means the rate stays 0.1."""
     check_id = "discount_idempotence"
     await _empty_cart(client)
@@ -227,7 +228,7 @@ async def check_discount_idempotence(client: AppClient) -> CheckResult:
     )
 
 
-async def check_price_sort_monotonic(client: AppClient) -> CheckResult:
+async def check_price_sort_monotonic(client: AppClient, questioner: ChatChannel | None = None) -> CheckResult:
     """Request price_asc over a wide page and record the price sequence."""
     check_id = "price_sort_monotonic"
     listing = await client.get("/api/products", params={"sort": "price_asc", "perPage": "50"})
@@ -253,7 +254,7 @@ async def check_price_sort_monotonic(client: AppClient) -> CheckResult:
     )
 
 
-async def check_search_case_equivalence(client: AppClient) -> CheckResult:
+async def check_search_case_equivalence(client: AppClient, questioner: ChatChannel | None = None) -> CheckResult:
     """Search the same term in two casings; record both result sets."""
     check_id = "search_case_equivalence"
     lower = await client.get("/api/products", params={"q": "laptop", "perPage": "50"})
@@ -292,7 +293,7 @@ async def check_search_case_equivalence(client: AppClient) -> CheckResult:
     )
 
 
-async def check_pagination_disjoint(client: AppClient) -> CheckResult:
+async def check_pagination_disjoint(client: AppClient, questioner: ChatChannel | None = None) -> CheckResult:
     """Fetch pages 1 and 2 and record whether any product id appears on both."""
     check_id = "pagination_disjoint"
     page1 = await client.get("/api/products", params={"page": "1", "perPage": "6"})
@@ -325,7 +326,7 @@ async def check_pagination_disjoint(client: AppClient) -> CheckResult:
     )
 
 
-async def check_negative_quantity_rejected(client: AppClient) -> CheckResult:
+async def check_negative_quantity_rejected(client: AppClient, questioner: ChatChannel | None = None) -> CheckResult:
     """Post quantity -1 and record the status the server returned."""
     check_id = "negative_quantity_rejected"
     response = await client.post(
@@ -350,7 +351,9 @@ async def check_negative_quantity_rejected(client: AppClient) -> CheckResult:
 
 
 async def check_referenced_routes_respond(
-    client: AppClient, app_map: AppMapData | None = None
+    client: AppClient,
+    app_map: AppMapData | None = None,
+    questioner: ChatChannel | None = None,
 ) -> CheckResult:
     """Probe the routes recon actually discovered and record each status.
 
@@ -358,12 +361,13 @@ async def check_referenced_routes_respond(
     list silently asserts that the target has *our* pages: against any other
     application every probe 404s and the oracle reports broken links that were
     never there -- a false positive manufactured by the harness itself.
+
+    When a route redirects to a login page, the bot pauses and asks the human
+    operator whether to skip behind the wall or provide credentials.
     """
     check_id = "referenced_routes_respond"
     routes = sorted(app_map.route_paths) if app_map is not None else []
     if not routes:
-        # No routes discovered means no probe, which the signal reads as "no
-        # opinion" rather than as "everything is fine".
         return CheckResult(
             check_id,
             "http",
@@ -372,17 +376,105 @@ async def check_referenced_routes_respond(
         )
 
     observed: dict[str, int] = {}
+    login_walls: list[str] = []
+    skipped: list[str] = []
+
     for route in routes:
         response = await client.get(route)
-        observed[route] = response.status if not response.error else 0
+        status = response.status if not response.error else 0
+
+        # Detect login redirects: the server sends the bot to /login or a
+        # similar path instead of returning the page.
+        is_login_redirect = (
+            status in (301, 302, 303, 307, 308)
+            and isinstance(response.text, str)
+            and any(kw in response.text.lower() for kw in ("/login", "/signin", "/auth"))
+        )
+
+        if is_login_redirect and questioner is not None and route not in login_walls:
+            login_walls.append(route)
+
+    # Ask the human about login walls in one batch rather than per-route.
+    skip_login = False
+    credentials: dict[str, str] | None = None
+    if login_walls and questioner is not None:
+        wall_list = ", ".join(login_walls)
+        answer = await questioner.ask(
+            f"I found pages that require login: {wall_list}",
+            options=[
+                "Skip those pages",
+                "I'll provide login credentials",
+            ],
+            context=(
+                "These routes redirect to a login page instead of showing "
+                "their content. I can skip them, or you can give me a "
+                "username and password to log in."
+            ),
+        )
+        answer_lower = answer.strip().lower()
+        if "skip" in answer_lower:
+            skip_login = True
+            await questioner.inform("OK — skipping pages that require login.")
+        elif "credential" in answer_lower or "provide" in answer_lower:
+            creds_answer = await questioner.ask(
+                "Please provide credentials as: username password",
+                context="For example: admin mysecretpass",
+            )
+            parts = creds_answer.strip().split(None, 1)
+            if len(parts) == 2:
+                credentials = {"username": parts[0], "password": parts[1]}
+                await questioner.inform(
+                    f"Got it — will try to log in as {credentials['username']}."
+                )
+            else:
+                await questioner.inform(
+                    "Couldn't parse credentials. Skipping login pages."
+                )
+                skip_login = True
+
+    # Now actually probe each route.
+    for route in routes:
+        response = await client.get(route)
+        status = response.status if not response.error else 0
+
+        is_login_redirect = (
+            status in (301, 302, 303, 307, 308)
+            and isinstance(response.text, str)
+            and any(kw in response.text.lower() for kw in ("/login", "/signin", "/auth"))
+        )
+
+        if is_login_redirect:
+            if skip_login:
+                skipped.append(route)
+                continue
+            if credentials is not None:
+                # Try to authenticate: POST to the login endpoint.
+                login_response = await client.post(
+                    "/login",
+                    {"username": credentials["username"], "password": credentials["password"]},
+                )
+                if not login_response.error and login_response.status in (200, 302):
+                    # Retry the original route after login.
+                    response = await client.get(route)
+                    status = response.status if not response.error else 0
+
+        observed[route] = status
+
+    detail_parts = [f"requested the {len(routes)} route(s) recon discovered"]
+    if skipped:
+        detail_parts.append(f"skipped {len(skipped)} route(s) behind login walls")
+    if credentials:
+        detail_parts.append(f"authenticated as {credentials['username']}")
 
     return CheckResult(
         check_id,
         "http",
-        f"requested the {len(routes)} route(s) recon discovered",
+        ". ".join(detail_parts),
         {
             "invariant": "every internal link returns a non-error status",
             "statuses": observed,
+            "login_walls": login_walls,
+            "skipped_routes": skipped,
         },
     )
 

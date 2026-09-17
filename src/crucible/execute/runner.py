@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from crucible.core.events import EventBus, EventType
 from crucible.core.logging import get_logger
+from crucible.core.qa import ChatChannel
 from crucible.execute.checks import CHECK_REGISTRY, CONTEXT_CHECK_REGISTRY, CheckResult
 from crucible.execute.client import AppClient
 from crucible.recon.scout import AppMapData
@@ -43,6 +44,7 @@ class CheckRunner:
         run_id: str,
         *,
         app_map: AppMapData | None = None,
+        questioner: ChatChannel | None = None,
     ) -> None:
         self._client = client
         self._session = session
@@ -51,6 +53,9 @@ class CheckRunner:
         #: Recon's findings, handed to the checks that cannot probe honestly
         #: without them (see CONTEXT_CHECK_REGISTRY).
         self._app_map = app_map
+        #: Interactive chat channel so checks can ask the human operator
+        #: for credentials or decisions when the bot is stuck.
+        self._questioner = questioner
 
     async def run_case(self, case: TestCase) -> ExecutionOutcome:
         """Execute one case's check, persist the execution, return the outcome."""
@@ -66,10 +71,12 @@ class CheckRunner:
         try:
             if check_id in CONTEXT_CHECK_REGISTRY:
                 result: CheckResult = await CONTEXT_CHECK_REGISTRY[check_id](
-                    self._client, self._app_map
+                    self._client, self._app_map, self._questioner
                 )
             else:
-                result = await CHECK_REGISTRY[check_id](self._client)
+                result = await CHECK_REGISTRY[check_id](
+                    self._client, self._questioner
+                )
         except Exception as exc:
             result = CheckResult(
                 check_id=case.requirement_ref or case.id,

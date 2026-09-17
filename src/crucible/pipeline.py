@@ -20,6 +20,7 @@ from crucible.benchmark.score import ScoreReport, fetch_manifest, score
 from crucible.core.config import Settings
 from crucible.core.events import EventBus, EventType
 from crucible.core.logging import get_logger
+from crucible.core.qa import ChatChannel
 from crucible.execute.browser import (
     BrowserRecording,
     BrowserUnavailable,
@@ -67,6 +68,8 @@ class PipelineResult:
     outcomes: list[SignalOutcome] = field(default_factory=list)
     #: Video and screenshots from the browser lane, when it could run.
     browser: BrowserRecording | None = None
+    #: The conversation between the agent and the human operator.
+    conversation: list[dict[str, Any]] | None = None
 
     def summary(self) -> dict[str, Any]:
         """Flat dict for the CLI report."""
@@ -234,6 +237,7 @@ async def run_pipeline(
     with_benchmark: bool = True,
     with_browser: bool = True,
     bus: EventBus | None = None,
+    channel: ChatChannel | None = None,
 ) -> PipelineResult:
     """Execute the full pipeline against ``base_url``.
 
@@ -251,6 +255,13 @@ async def run_pipeline(
     if bus is None:
         bus = EventBus(run_id)
     await bus.emit(EventType.RUN_STARTED, base_url=base_url)
+
+    # Interactive chat channel: the pipeline can ask the human operator
+    # questions ("I found a login wall — skip it?", "What's the password?")
+    # and pauses until they answer via the dashboard.
+    if channel is None:
+        chat_log_path = artifacts.root / run_id / "conversation.json"
+        channel = ChatChannel(bus, log_path=chat_log_path)
 
     # ---- plan -------------------------------------------------------------
     await bus.emit(EventType.PLAN_STARTED)
@@ -289,7 +300,10 @@ async def run_pipeline(
         await reset_target(client)
 
         with session_factory() as session:
-            runner = CheckRunner(client, session, bus, run_id, app_map=app_map)
+            runner = CheckRunner(
+                client, session, bus, run_id,
+                app_map=app_map, questioner=channel,
+            )
             outcomes: list[ExecutionOutcome] = await runner.run_all(case_rows)
             for execution_outcome in outcomes:
                 execution_count += 1
@@ -367,6 +381,9 @@ async def run_pipeline(
         else:
             artifacts.save_json(run_id, "benchmark", benchmark_report.as_dict())
 
+    # Persist the conversation log so it can be replayed later.
+    channel.save()
+
     with session_factory() as session:
         run_row = session.get(Run, run_id)
         if run_row is not None:
@@ -393,4 +410,5 @@ async def run_pipeline(
         app_map=app_map,
         outcomes=all_outcomes,
         browser=browser_recording,
+        conversation=[msg.as_dict() for msg in channel.messages],
     )

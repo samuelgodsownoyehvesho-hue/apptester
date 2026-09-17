@@ -111,6 +111,66 @@
   .cite .sig { color: var(--accent); font-family: var(--mono); font-size: 11.5px; }
   .cite .det { color: var(--text); }
 
+  #chatSection {
+    margin: 0 22px 40px;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; overflow: hidden;
+  }
+  #chatSection > h2 {
+    margin: 0; padding: 12px 15px; font-size: 12px; letter-spacing: .09em;
+    text-transform: uppercase; color: var(--muted);
+    border-bottom: 1px solid var(--line); background: var(--panel-2);
+  }
+  #chatMessages {
+    height: 260px; overflow-y: auto; padding: 14px 16px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .chat-msg {
+    max-width: 80%; padding: 10px 14px; border-radius: 10px;
+    font-size: 13.5px; line-height: 1.5; white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .chat-msg.agent {
+    align-self: flex-start;
+    background: var(--panel-2); border: 1px solid var(--line);
+    color: var(--text);
+  }
+  .chat-msg.human {
+    align-self: flex-end;
+    background: #1a3a5c; border: 1px solid #2a5580;
+    color: #d0e4ff;
+  }
+  .chat-msg .role {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .09em;
+    color: var(--muted); margin-bottom: 4px;
+  }
+  .chat-msg.agent .role { color: var(--accent); }
+  .chat-msg.human .role { color: #6aa9ff; }
+  .chat-msg .opts {
+    margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap;
+  }
+  .chat-msg .opts button {
+    padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--text); font-size: 12px;
+    cursor: pointer;
+  }
+  .chat-msg .opts button:hover { border-color: var(--accent); }
+  #chatInput {
+    display: flex; gap: 8px; padding: 10px 16px 14px;
+    border-top: 1px solid var(--line);
+  }
+  #chatInput input {
+    flex: 1; padding: 10px 13px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--panel-2);
+    color: var(--text); font-size: 13px;
+  }
+  #chatInput input:focus { outline: none; border-color: var(--accent); }
+  #chatInput button {
+    padding: 10px 18px; border-radius: 8px; border: 0; cursor: pointer;
+    background: var(--accent); color: #0b1020; font-weight: 600; font-size: 13px;
+  }
+  #chatInput button:disabled { opacity: .4; cursor: not-allowed; }
+
   #browserSection { display: none; margin: 0 22px 40px; }
   #browserVideo {
     width: 100%; max-width: 880px; border-radius: 10px; background: #000;
@@ -160,6 +220,15 @@
   </div>
 </main>
 
+<section id="chatSection">
+  <h2>Talk to the agent <span class="badge" id="chatBadge">0</span></h2>
+  <div id="chatMessages"></div>
+  <div id="chatInput">
+    <input type="text" id="chatText" placeholder="Type a message to the agent…" disabled />
+    <button id="chatSend" disabled>Send</button>
+  </div>
+</section>
+
 <section id="browserSection">
   <h2>What the browser saw <span class="badge" id="browserLabel"></span></h2>
   <div class="pad">
@@ -182,6 +251,51 @@
   const statusText = $("statusText");
   let source = null;
   let started = 0;
+  let currentStreamId = null;
+  let pendingQuestionId = null;
+
+  // --- Chat helpers ---
+  function addChatMsg(role, text, options, messageId) {
+    const div = document.createElement("div");
+    div.className = `chat-msg ${role}`;
+    div.innerHTML = `<div class="role">${role === "agent" ? "🤖 Agent" : "👤 You"}</div>${esc(text)}`;
+
+    if (options && options.length && role === "agent") {
+      const opts = document.createElement("div");
+      opts.className = "opts";
+      options.forEach((opt) => {
+        const btn = document.createElement("button");
+        btn.textContent = opt;
+        btn.onclick = () => sendAnswer(opt, messageId);
+        opts.appendChild(btn);
+      });
+      div.appendChild(opts);
+      pendingQuestionId = messageId;
+    }
+
+    $("chatMessages").appendChild(div);
+    $("chatMessages").scrollTop = $("chatMessages").scrollHeight;
+    const count = $("chatMessages").children.length;
+    $("chatBadge").textContent = count;
+  }
+
+  async function sendAnswer(text, messageId) {
+    if (!currentStreamId || !messageId) return;
+    // Disable the buttons so they can't be clicked again.
+    document.querySelectorAll(".chat-msg .opts button").forEach((b) => b.disabled = true);
+    // Add as human message
+    addChatMsg("human", text, null, null);
+    pendingQuestionId = null;
+    try {
+      await fetch(`/api/runs/${currentStreamId}/answer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message_id: messageId, text }),
+      });
+    } catch (e) {
+      console.error("answer failed:", e);
+    }
+  }
 
   const stamp = () => {
     const s = Math.floor((Date.now() - started) / 1000);
@@ -246,6 +360,11 @@
         return line("", `<span class="k-stage">Finished</span> — ${p.findings} finding(s)`);
       case "run.failed":
         return line("err", `<span class="k-bad">Run failed</span> ${esc(p.error)}`);
+      case "question.asked":
+        addChatMsg("agent", p.text, p.options, p.message_id);
+        return line("", `<span class="k-check">question</span> ${esc(p.text)}`);
+      case "question.answered":
+        return line("", `<span class="k-good">answer</span> ${esc(p.text)}`);
       case "stream.end":
         return null;
       default:
@@ -342,6 +461,9 @@
     $("browserVideo").removeAttribute("src");
     $("shots").innerHTML = "";
     $("consoleLog").innerHTML = "";
+    $("chatMessages").innerHTML = "";
+    $("chatBadge").textContent = "0";
+    pendingQuestionId = null;
     go.disabled = true;
     started = Date.now();
     dot.className = "dot live"; statusText.textContent = "starting";
@@ -360,11 +482,17 @@
         return;
       }
       ({ stream_id: streamId } = await res.json());
+      currentStreamId = streamId;
     } catch (e) {
       line("err", `<span class="k-bad">Could not start</span> ${esc(e.message)}`);
       go.disabled = false; dot.className = "dot fail"; statusText.textContent = "error";
       return;
     }
+
+    // Enable the chat input once a run is active.
+    $("chatText").disabled = false;
+    $("chatSend").disabled = false;
+    addChatMsg("agent", "Scan started — I'll tell you what I find and ask when I'm stuck.", null, null);
 
     let count = 0;
     source = new EventSource(`/api/runs/${streamId}/events`);
@@ -383,8 +511,25 @@
     source.onerror = () => {
       if (source) { source.close(); source = null; }
       go.disabled = false;
+      $("chatText").disabled = true;
+      $("chatSend").disabled = true;
       refresh(streamId);
     };
+  });
+
+  // Chat send button and enter key.
+  $("chatSend").onclick = () => {
+    const text = $("chatText").value.trim();
+    if (!text || !currentStreamId) return;
+    if (pendingQuestionId) {
+      sendAnswer(text, pendingQuestionId);
+    } else {
+      addChatMsg("human", text, null, null);
+    }
+    $("chatText").value = "";
+  };
+  $("chatText").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") $("chatSend").click();
   });
 })();
 </script>

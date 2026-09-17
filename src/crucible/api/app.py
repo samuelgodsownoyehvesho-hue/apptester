@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from crucible.core.config import Settings
 from crucible.core.events import Event, EventBus, EventType
 from crucible.core.logging import get_logger
+from crucible.core.qa import ChatChannel
 from crucible.pipeline import PipelineResult, run_pipeline
 from crucible.store.artifacts import ArtifactStore
 from crucible.store.db import (
@@ -61,6 +62,13 @@ class RunRequest(BaseModel):
     url: str
 
 
+class AnswerRequest(BaseModel):
+    """What the browser posts to reply to a question."""
+
+    message_id: str
+    text: str
+
+
 @dataclass
 class RunState:
     """Everything a viewer can know about one run."""
@@ -73,6 +81,8 @@ class RunState:
     error: str | None = None
     #: Held so the task is not garbage collected mid-run.
     task: asyncio.Task[None] | None = None
+    #: The live chat channel for this run, if the pipeline has created one.
+    channel: ChatChannel | None = None
 
     def summary(self) -> dict[str, Any]:
         """Flat status payload for the browser."""
@@ -82,6 +92,11 @@ class RunState:
             "status": self.status,
             "error": self.error,
             "event_count": len(self.events),
+            "conversation": (
+                [msg.as_dict() for msg in self.channel.messages]
+                if self.channel is not None
+                else []
+            ),
         }
         if self.result is None:
             return payload
@@ -149,6 +164,9 @@ class RunRegistry:
 
         bus = EventBus(stream_id)
         bus.subscribe(state.events.append)
+        # The channel is created here so the API can expose it for answers
+        # before the pipeline even starts.
+        state.channel = ChatChannel(bus)
         state.task = asyncio.create_task(self._drive(state, bus))
         self._runs[stream_id] = state
         return state
@@ -162,6 +180,7 @@ class RunRegistry:
                 self._session_factory,
                 self._artifacts,
                 bus=bus,
+                channel=state.channel,
             )
         except Exception as exc:
             state.status = "failed"
@@ -303,5 +322,23 @@ def create_app(settings: Settings) -> FastAPI:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    @app.post("/api/runs/{stream_id}/answer")
+    async def answer_question(stream_id: str, request: AnswerRequest) -> dict[str, Any]:
+        """Submit an answer to a question the agent asked."""
+        state = registry.get(stream_id)
+        if state is None:
+            raise HTTPException(status_code=404, detail=f"unknown run {stream_id!r}")
+        if state.channel is None:
+            raise HTTPException(
+                status_code=400, detail="This run has no chat channel"
+            )
+        accepted = await state.channel.answer(request.message_id, request.text)
+        if not accepted:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No pending question with id {request.message_id!r}",
+            )
+        return {"ok": True}
 
     return app

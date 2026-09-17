@@ -52,6 +52,9 @@ class EventType(StrEnum):
     VERDICT_REACHED = "oracle.verdict"
     FINDING_RECORDED = "triage.finding"
 
+    QUESTION_ASKED = "question.asked"
+    ANSWER_RECEIVED = "question.answered"
+
     BUDGET_WARNING = "budget.warning"
 
 
