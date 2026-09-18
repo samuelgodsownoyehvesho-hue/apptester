@@ -78,6 +78,11 @@ class CheckRunner:
                     self._client, self._questioner
                 )
         except Exception as exc:
+            # Logged in full, not just summarised. The error text was previously
+            # kept in memory only, so a run where every check failed reported
+            # "check raised an exception" with no traceback anywhere -- leaving
+            # the cause undiscoverable after the fact.
+            logger.exception("check_raised check_id=%s case_id=%s", check_id, case.id)
             result = CheckResult(
                 check_id=case.requirement_ref or case.id,
                 lane="error",

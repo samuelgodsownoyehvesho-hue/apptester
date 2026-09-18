@@ -11,6 +11,8 @@ and the benchmark need.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -20,6 +22,7 @@ from crucible.benchmark.score import ScoreReport, fetch_manifest, score
 from crucible.core.config import Settings
 from crucible.core.events import EventBus, EventType
 from crucible.core.logging import get_logger
+from crucible.core.progress import FindingNote, ProgressTracker, RunProgress
 from crucible.core.qa import ChatChannel
 from crucible.execute.browser import (
     BrowserRecording,
@@ -27,7 +30,9 @@ from crucible.execute.browser import (
     record_walk,
 )
 from crucible.execute.client import AppClient, HttpAppClient, reset_target
+from crucible.execute.interact import InteractionReport, exercise_elements
 from crucible.execute.runner import CheckRunner, ExecutionOutcome
+from crucible.llm.chat import ConversationalResponder
 from crucible.oracle.signals import SIGNALS_BY_CHECK, SignalOutcome, reach_verdict
 from crucible.plan.synthesize import synthesize_cases
 from crucible.recon.fetcher import HttpFetcher
@@ -52,6 +57,95 @@ from crucible.triage.cluster import write_findings
 logger = get_logger(__name__)
 
 
+def _elements_by_route(app_map: AppMapData) -> dict[str, list[dict[str, Any]]]:
+    """Group the element inventory by the route each element was found on."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for entry in app_map.elements:
+        page = str(entry.get("page") or "")
+        if not page:
+            continue
+        grouped.setdefault(page, []).append(
+            {key: value for key, value in entry.items() if key != "page"}
+        )
+    return grouped
+
+
+async def _run_interaction_lane(
+    base_url: str,
+    app_map: AppMapData,
+    run_id: str,
+    artifacts: ArtifactStore,
+    settings: Settings,
+    channel: ChatChannel,
+    bus: EventBus,
+) -> InteractionReport | None:
+    """Press every control reconnaissance found, if there is a browser to do it in.
+
+    Optional in the same way the walk lane is: no browser must degrade the
+    report, never fail the run. An empty inventory is reported as a reason
+    rather than passing silently, so "no browser findings" is never mistaken for
+    "everything worked".
+    """
+    if not settings.interact_enabled:
+        await bus.emit(EventType.INTERACT_UNAVAILABLE, reason="disabled by configuration")
+        return None
+
+    elements_by_route = _elements_by_route(app_map)
+    total = sum(len(items) for items in elements_by_route.values())
+    if not total:
+        await bus.emit(
+            EventType.INTERACT_UNAVAILABLE,
+            reason="reconnaissance found no interactive elements",
+        )
+        return None
+
+    await channel.inform(
+        f"Now pressing every control I found: {total} of them across "
+        f"{len(elements_by_route)} page(s). This part takes a while."
+    )
+    try:
+        return await exercise_elements(
+            base_url,
+            elements_by_route,
+            run_id,
+            artifacts,
+            bus=bus,
+            max_elements=settings.interact_max_elements,
+            interaction_timeout_ms=settings.interact_timeout_ms,
+            settle_ms=settings.interact_settle_ms,
+            delay_ms=settings.interact_delay_ms,
+        )
+    except BrowserUnavailable as exc:
+        logger.warning("interaction_lane_unavailable reason=%s", exc)
+        await bus.emit(EventType.INTERACT_UNAVAILABLE, reason=str(exc))
+        return None
+    except Exception as exc:
+        # The lane is additive: it must never be the reason a run that has
+        # already found things fails to report them.
+        logger.exception("interaction_lane_failed")
+        await bus.emit(EventType.INTERACT_UNAVAILABLE, reason=f"{type(exc).__name__}: {exc}")
+        return None
+
+
+@asynccontextmanager
+async def _client_scope(
+    supplied: AppClient | None, base_url: str
+) -> AsyncIterator[AppClient]:
+    """Yield a client for the execution phase, closing it only if we made it.
+
+    A caller-supplied client is not ours to close: the benchmark stage reads the
+    target's manifest through the same object later in the run, and a caller may
+    reasonably hold on to it afterwards. Closing it here is what left every check
+    talking to a dead transport -- each one errored, and a run that had found ten
+    defects reported one while looking perfectly healthy.
+    """
+    if supplied is not None:
+        yield supplied
+        return
+    async with HttpAppClient(base_url) as client:
+        yield client
+
+
 @dataclass(slots=True)
 class PipelineResult:
     """Everything a caller needs to know after one pipeline run."""
@@ -68,8 +162,25 @@ class PipelineResult:
     outcomes: list[SignalOutcome] = field(default_factory=list)
     #: Video and screenshots from the browser lane, when it could run.
     browser: BrowserRecording | None = None
+    #: The interaction pass: what was pressed, what broke, and its recording.
+    interaction: InteractionReport | None = None
     #: The conversation between the agent and the human operator.
     conversation: list[dict[str, Any]] | None = None
+
+    @property
+    def full_video_key(self) -> str | None:
+        """The recording of the whole run, preferring the fullest one available.
+
+        The interaction pass drives every page and every control, so its video
+        already contains the walk. Falling back to the walk lane's recording
+        keeps a video available when interactions were switched off or when no
+        elements were found to press.
+        """
+        if self.interaction is not None and self.interaction.video_key:
+            return self.interaction.video_key
+        if self.browser is not None:
+            return self.browser.video_key
+        return None
 
     def summary(self) -> dict[str, Any]:
         """Flat dict for the CLI report."""
@@ -82,6 +193,8 @@ class PipelineResult:
             "findings": self.findings,
             "benchmark": self.benchmark.as_dict() if self.benchmark else None,
             "browser": self.browser.as_dict() if self.browser else None,
+            "interaction": self.interaction.as_dict() if self.interaction else None,
+            "full_video_key": self.full_video_key,
         }
 
 
@@ -238,6 +351,7 @@ async def run_pipeline(
     with_browser: bool = True,
     bus: EventBus | None = None,
     channel: ChatChannel | None = None,
+    progress: RunProgress | None = None,
 ) -> PipelineResult:
     """Execute the full pipeline against ``base_url``.
 
@@ -249,11 +363,20 @@ async def run_pipeline(
     viewer needs that: the database run id is not known until reconnaissance
     has already begun, so the caller's own id identifies the stream.
     """
+    # The progress snapshot is attached to the bus *before* reconnaissance when
+    # a bus already exists: the crawl is the longest silent stretch of a run and
+    # therefore the moment an operator is most likely to ask what is going on.
+    if progress is None:
+        progress = RunProgress(target=base_url)
+    if bus is not None:
+        bus.subscribe(ProgressTracker(progress))
+
     target_id, run_id, app_map = await run_recon(
         base_url, settings, session_factory, artifacts, fetcher=fetcher, bus=bus
     )
     if bus is None:
         bus = EventBus(run_id)
+        bus.subscribe(ProgressTracker(progress))
     await bus.emit(EventType.RUN_STARTED, base_url=base_url)
 
     # Interactive chat channel: the pipeline can ask the human operator
@@ -262,6 +385,26 @@ async def run_pipeline(
     if channel is None:
         chat_log_path = artifacts.root / run_id / "conversation.json"
         channel = ChatChannel(bus, log_path=chat_log_path)
+        # A run driven straight from the CLI answers questions through the same
+        # channel the dashboard uses, rather than falling silent for want of a
+        # caller to start the responder.
+        cli_responder = ConversationalResponder(progress, settings=settings)
+        channel.start_responding(cli_responder, aclose=cli_responder.aclose)
+    else:
+        # The dashboard has to build the channel before the run has an id, so
+        # the conversation log can only be attached now. Without this the
+        # conversation lives in memory alone and is lost with the process.
+        channel.enable_log(artifacts.root / run_id / "conversation.json")
+
+    # Reconnaissance facts are taken from the app map rather than from the
+    # recon events: a caller-supplied bus may already have carried them before
+    # this run attached a tracker, and the map is authoritative regardless.
+    progress.routes = len(app_map.routes)
+    progress.forms = len(app_map.forms)
+    progress.broken = len(app_map.failed_routes)
+    # A no-op when a responder is already running -- the dashboard starts one its
+    # own way -- and the fallback for a caller that supplies a bare channel.
+    channel.start_responding(progress.reply)
 
     await channel.inform(
         f"I'm exploring the site. Found {len(app_map.routes)} pages, "
@@ -298,36 +441,58 @@ async def run_pipeline(
     error_by_execution: dict[str, str | None] = {}
     execution_count = 0
 
-    async with (app_client if app_client is not None else HttpAppClient(base_url)) as client:
-        # Best-effort reset before probing. Without it a second run inherits the
-        # first run's cart, so the same code reports different numbers -- and
-        # can reach a different verdict -- purely because of run order.
-        await reset_target(client)
-
     await channel.inform(
         f"Planning complete. I'm going to run {len(planned)} checks "
         f"to look for bugs."
     )
 
-    with session_factory() as session:
-        runner = CheckRunner(
-            client, session, bus, run_id,
-            app_map=app_map, questioner=channel,
-        )
-        outcomes: list[ExecutionOutcome] = await runner.run_all(case_rows)
-        for execution_outcome in outcomes:
-            execution_count += 1
-            error_by_execution[execution_outcome.execution_id] = (
-                execution_outcome.result.error
-            )
-            signals_by_execution[execution_outcome.execution_id] = _derive_signals(
-                execution_outcome
-            )
+    # One client spans the reset and every check: previously the reset lived in
+    # a block of its own that closed the client before the checks ran.
+    async with _client_scope(app_client, base_url) as client:
+        # Best-effort reset before probing. Without it a second run inherits the
+        # first run's cart, so the same code reports different numbers -- and
+        # can reach a different verdict -- purely because of run order.
+        await reset_target(client)
 
-        decisions = _persist_verdicts(
-            session, signals_by_execution, error_by_execution
-        )
-        session.commit()
+        with session_factory() as session:
+            runner = CheckRunner(
+                client, session, bus, run_id,
+                app_map=app_map, questioner=channel,
+            )
+            outcomes: list[ExecutionOutcome] = await runner.run_all(case_rows)
+            for execution_outcome in outcomes:
+                execution_count += 1
+                error_by_execution[execution_outcome.execution_id] = (
+                    execution_outcome.result.error
+                )
+                signals_by_execution[execution_outcome.execution_id] = _derive_signals(
+                    execution_outcome
+                )
+
+            decisions = _persist_verdicts(
+                session, signals_by_execution, error_by_execution
+            )
+            session.commit()
+
+    # ---- interaction lane -------------------------------------------------
+    # Runs before the verdict is reached so a dead button is judged alongside
+    # every other observation. Reported after the fact, it would be evidence the
+    # report never mentions -- which is indistinguishable from not having looked.
+    interaction = await _run_interaction_lane(
+        base_url, app_map, run_id, artifacts, settings, channel, bus
+    )
+    # Controls on a page that never loaded are excluded: "not tested" is not
+    # evidence of a defect, and passing them on would turn an unreachable target
+    # into a page full of broken buttons.
+    interaction_results = (
+        [
+            result.as_check_result()
+            for result in interaction.results
+            if not result.skipped
+        ]
+        if interaction is not None
+        else []
+    )
 
     # reach_verdict is the single aggregation path, shared with the oracle's own
     # tests. It also folds in signals that come from recon rather than from an
@@ -335,7 +500,7 @@ async def run_pipeline(
     # dropped them, so a genuinely unlabelled form control never reached a
     # finding and scored as a miss.
     aggregate, aggregate_confidence, all_outcomes = reach_verdict(
-        [outcome.result for outcome in outcomes], app_map
+        [outcome.result for outcome in outcomes] + interaction_results, app_map
     )
     _ = decisions  # per-execution; the aggregate above is what the CLI shows
 
@@ -382,6 +547,19 @@ async def run_pipeline(
         findings: list[Finding] = await write_findings(run_id, all_outcomes, bus)
         session.add_all(findings)
         session.commit()
+        # Triage has now produced the plain-language cause and fix, which the
+        # event stream does not carry. Folding them in lets the agent answer
+        # "why" with the real reason instead of just the finding's title.
+        progress.replace_notes(
+            [
+                FindingNote(
+                    title=row.title,
+                    cause=row.root_cause or "",
+                    fix=row.suggested_fix or "",
+                )
+                for row in findings
+            ]
+        )
 
     # ---- benchmark --------------------------------------------------------
     benchmark_report: ScoreReport | None = None
@@ -401,9 +579,6 @@ async def run_pipeline(
             logger.warning("benchmark_unavailable err=%s", exc)
         else:
             artifacts.save_json(run_id, "benchmark", benchmark_report.as_dict())
-
-    # Persist the conversation log so it can be replayed later.
-    channel.save()
 
     if benchmark_report:
         await channel.inform(
@@ -431,6 +606,13 @@ async def run_pipeline(
         benchmark=benchmark_report.as_dict() if benchmark_report else None,
     )
 
+    # Stop answering only now. The stop sentinel queues behind anything the
+    # operator already sent, so every message they typed still gets a reply, but
+    # nothing can be appended after the conversation has been written to disk --
+    # which is what previously left the log missing its own last messages.
+    await channel.aclose_responding()
+    channel.save()
+
     return PipelineResult(
         run_id=run_id,
         target_id=target_id,
@@ -443,5 +625,6 @@ async def run_pipeline(
         app_map=app_map,
         outcomes=all_outcomes,
         browser=browser_recording,
+        interaction=interaction,
         conversation=[msg.as_dict() for msg in channel.messages],
     )

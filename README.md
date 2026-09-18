@@ -19,6 +19,7 @@ Phase 1, in progress. What exists today:
 | Structured logging (text + JSON) | ✅ implemented |
 | Storage (SQLite + local artifacts) | ✅ implemented, tested |
 | Recon scout → app map | ✅ implemented, tested |
+| Interactive-element inventory (buttons, links, inputs, selects, click handlers) | ✅ implemented, tested |
 | Test plan synthesis with risk ranking | ✅ implemented, tested |
 | API execution lane (checks + runner) | ✅ implemented, tested |
 | Oracle signals → verdict | ✅ implemented, tested (deterministic signals only) |
@@ -27,8 +28,31 @@ Phase 1, in progress. What exists today:
 | CLI (`doctor`, `recon`, `run`, `serve`) | ✅ implemented |
 | Live dashboard | ✅ implemented |
 | Guinea pig app + mutant registry | ✅ built, run manually |
-| Browser lane (Playwright) | ⏳ not started |
-| LLM-as-judge oracle signal | ⏳ not started — no reachable provider here |
+| Browser lane (Playwright): walk and record | ✅ implemented — screenshots, console errors, video |
+| Interaction lane: press every control, fill every field, exercise every option | ✅ implemented — 246 controls / 18 pages in ~15 min against the guinea pig |
+| Interaction failures as first-class oracle evidence | ✅ implemented — a broken control is a finding, not a side note |
+| Full-run video (one continuous recording of every interaction) | ✅ implemented |
+| Conversation with the operator during a run | ✅ implemented — model-backed, with grounded replies as the fallback |
+| LLM-as-judge oracle signal | ⏳ not started — the chat responder uses a provider, but verdicts are still deterministic |
+
+### Coverage: what is default, and what is shop-specific
+
+The nine arithmetic/metamorphic checks in `plan/synthesize.py` and
+`execute/checks.py` speak the API of the bundled demo shop (`apps/guinea_pig`).
+They are *opt-in* in effect: reconnaissance only synthesises them for a target
+whose app map looks like that shop (cart and catalog endpoints present).
+
+The lanes that apply to **any** site are the generic ones:
+
+- **Route reachability** — every linked route must respond.
+- **Interaction lane** — every control reconnaissance found is pressed in a real
+  browser and judged on four questions: did the page throw a JS error, did a
+  request come back 4xx/5xx, did anything change at all, did it hang.
+- **Accessibility** — every observed form control must have an accessible name.
+
+Run with `INTERACT_ENABLED=false` to skip the interaction pass, or
+`INTERACT_MAX_ELEMENTS=<n>` to bound it. `INTERACT_MAX_ELEMENTS=0` (the default)
+means no ceiling: a truncated pass reads as coverage it is not.
 
 ## Why this exists
 

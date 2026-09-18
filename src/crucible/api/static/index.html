@@ -232,8 +232,15 @@
 <section id="browserSection">
   <h2>What the browser saw <span class="badge" id="browserLabel"></span></h2>
   <div class="pad">
-    <video id="browserVideo" controls loop muted playsinline preload="metadata"></video>
+    <video id="browserVideo" controls muted playsinline preload="metadata"></video>
     <div class="shots" id="shots"></div>
+    <details id="interactionWrap" style="display:none">
+      <summary>
+        Controls pressed (<span id="interactionCount">0</span>)
+        \u2014 <span id="interactionFails">0</span> failed
+      </summary>
+      <div id="interactionLog"></div>
+    </details>
     <details id="consoleWrap" style="display:none">
       <summary>Browser errors (<span id="consoleCount">0</span>)</summary>
       <div id="consoleLog"></div>
@@ -253,9 +260,16 @@
   let started = 0;
   let currentStreamId = null;
   let pendingQuestionId = null;
+  //: Message ids already on screen. Both the live event stream and the run's
+  //: conversation snapshot describe the same turns, and without this the same
+  //: bubble would be drawn twice.
+  const renderedIds = new Set();
 
   // --- Chat helpers ---
   function addChatMsg(role, text, options, messageId) {
+    if (messageId && renderedIds.has(messageId)) return;
+    if (messageId) renderedIds.add(messageId);
+
     const div = document.createElement("div");
     div.className = `chat-msg ${role}`;
     div.innerHTML = `<div class="role">${role === "agent" ? "🤖 Agent" : "👤 You"}</div>${esc(text)}`;
@@ -279,22 +293,74 @@
     $("chatBadge").textContent = count;
   }
 
-  async function sendAnswer(text, messageId) {
-    if (!currentStreamId || !messageId) return;
-    // Disable the buttons so they can't be clicked again.
-    document.querySelectorAll(".chat-msg .opts button").forEach((b) => b.disabled = true);
-    // Add as human message
-    addChatMsg("human", text, null, null);
-    pendingQuestionId = null;
+  async function postChat(path, body) {
     try {
-      await fetch(`/api/runs/${currentStreamId}/answer`, {
+      const res = await fetch(path, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message_id: messageId, text }),
+        body: JSON.stringify(body),
       });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        line("err", `<span class="k-bad">Message not sent</span> ${esc(err.detail || res.status)}`);
+        return false;
+      }
+      return true;
     } catch (e) {
-      console.error("answer failed:", e);
+      line("err", `<span class="k-bad">Message not sent</span> ${esc(e.message)}`);
+      return false;
     }
+  }
+
+  /**
+   * Send whatever the operator typed.
+   *
+   * A pending question gets answered; anything else is posted as a chat
+   * message the agent can reply to. Previously a typed message with no
+   * question outstanding was only drawn locally, so it looked like the agent
+   * was ignoring the operator.
+   */
+  async function sendChat(text) {
+    if (!currentStreamId) {
+      line("err", `<span class="k-bad">No run</span> start a scan before chatting`);
+      return;
+    }
+    const questionId = pendingQuestionId;
+    pendingQuestionId = null;
+
+    const ok = questionId
+      ? await postChat(`/api/runs/${currentStreamId}/answer`, {
+          message_id: questionId,
+          text,
+        })
+      : await postChat(`/api/runs/${currentStreamId}/message`, { text });
+
+    if (!ok) {
+      if (questionId) pendingQuestionId = questionId;
+      return;
+    }
+    if (questionId) {
+      document.querySelectorAll(".chat-msg .opts button").forEach((b) => (b.disabled = true));
+    }
+    // The server owns the conversation; redraw from it so both the operator's
+    // message and the agent's reply come from one source of truth.
+    refresh(currentStreamId);
+  }
+
+  /** Draw the server's conversation, skipping turns already on screen. */
+  function renderConversation(conversation) {
+    if (!Array.isArray(conversation)) return;
+    const answered = new Set(
+      conversation.filter((m) => m.in_reply_to).map((m) => m.in_reply_to)
+    );
+    let lastPending = null;
+    conversation.forEach((msg) => {
+      if (msg.role === "agent" && msg.requires_answer && !answered.has(msg.id)) {
+        lastPending = msg.id;
+      }
+      addChatMsg(msg.role, msg.text, msg.options || null, msg.id);
+    });
+    pendingQuestionId = lastPending;
   }
 
   const stamp = () => {
@@ -365,6 +431,18 @@
         return line("", `<span class="k-check">question</span> ${esc(p.text)}`);
       case "question.answered":
         return line("", `<span class="k-good">answer</span> ${esc(p.text)}`);
+      case "human.message":
+        return line("", `<span class="k-mute">you</span> ${esc(p.text)}`);
+      case "interact.started":
+        return line("", `<span class="k-stage">Interacting</span> — exercising every control on ${p.routes} page(s)`);
+      case "interact.element_finished":
+        return line(p.ok ? "" : "err", `<span class="k-mute">${esc(p.kind)}</span> <span class="k-check">${esc(p.label || p.selector)}</span> ${p.ok
+          ? `<span class="k-good">\u2192 ok</span>`
+          : `<span class="k-bad">\u2192 ${esc(p.status)}</span>`}`);
+      case "interact.finished":
+        return line("", `<span class="k-stage">Interaction done</span> — ${p.elements} control(s), ${p.failures} failed`);
+      case "interact.unavailable":
+        return line("err", `<span class="k-bad">No interaction lane</span> ${esc(p.reason)}`);
       case "stream.end":
         return null;
       default:
@@ -409,16 +487,35 @@
       `;
     }
 
-    if (d.browser) {
-      const b = d.browser;
+    renderConversation(d.conversation);
+
+    if (d.browser || d.interaction) {
+      const b = d.browser || {};
+      const it = d.interaction;
       $("browserSection").style.display = "";
-      $("browserLabel").textContent = b.browser;
-      if (b.video_key) {
+      // The interaction pass drives every page and every control, so its
+      // recording already contains the walk. Prefer it, and say so, so the
+      // longer video is not mistaken for the short page-by-page one.
+      const fullKey = d.full_video_key;
+      const isFull = Boolean(it && it.video_key && fullKey === it.video_key);
+      $("browserLabel").textContent =
+        (b.browser || "browser") + (isFull ? " \u00b7 full run" : " \u00b7 pages only");
+      if (fullKey) {
         const video = $("browserVideo");
-        const src = `/api/artifacts/${b.video_key}`;
         // Only reassign when it changed, or the video restarts on every poll.
-        if (!video.src.endsWith(b.video_key)) video.src = src;
+        if (!video.src.endsWith(fullKey)) video.src = `/api/artifacts/${fullKey}`;
       }
+
+      $("interactionCount").textContent = it ? it.elements : 0;
+      $("interactionFails").textContent = it ? it.failures : 0;
+      $("interactionWrap").style.display = it && it.elements ? "" : "none";
+      $("interactionLog").innerHTML = it
+        ? (it.results || [])
+            .filter((r) => !r.ok)
+            .map((r) =>
+              `<div>[${esc(r.failure)}] ${esc(r.kind)} ${esc(r.label)} on ${esc(r.route)} \u2014 ${esc(r.detail)}</div>`)
+            .join("")
+        : "";
       $("shots").innerHTML = (b.screenshots || []).map((s) => `
         <div class="shot">
           <a href="/api/artifacts/${s.key}" target="_blank" rel="noopener">
@@ -463,6 +560,7 @@
     $("consoleLog").innerHTML = "";
     $("chatMessages").innerHTML = "";
     $("chatBadge").textContent = "0";
+    renderedIds.clear();
     pendingQuestionId = null;
     go.disabled = true;
     started = Date.now();
@@ -520,13 +618,9 @@
   // Chat send button and enter key.
   $("chatSend").onclick = () => {
     const text = $("chatText").value.trim();
-    if (!text || !currentStreamId) return;
-    if (pendingQuestionId) {
-      sendAnswer(text, pendingQuestionId);
-    } else {
-      addChatMsg("human", text, null, null);
-    }
+    if (!text) return;
     $("chatText").value = "";
+    sendChat(text);
   };
   $("chatText").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") $("chatSend").click();

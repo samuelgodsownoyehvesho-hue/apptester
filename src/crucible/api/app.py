@@ -32,7 +32,9 @@ from sqlalchemy.orm import Session, sessionmaker
 from crucible.core.config import Settings
 from crucible.core.events import Event, EventBus, EventType
 from crucible.core.logging import get_logger
+from crucible.core.progress import RunProgress
 from crucible.core.qa import ChatChannel
+from crucible.llm.chat import ConversationalResponder
 from crucible.pipeline import PipelineResult, run_pipeline
 from crucible.store.artifacts import ArtifactStore
 from crucible.store.db import (
@@ -69,6 +71,20 @@ class AnswerRequest(BaseModel):
     text: str
 
 
+class MessageRequest(BaseModel):
+    """A free-form message that is not a reply to any pending question."""
+
+    text: str
+
+
+#: Sent when someone types at a run that has already stopped. Answering is
+#: better than silence: an unanswered message reads as a broken agent.
+FINISHED_RUN_REPLY = (
+    "That run has already finished, so there is nothing left for me to do "
+    "with that. Start another scan and I'll pick it up from there."
+)
+
+
 @dataclass
 class RunState:
     """Everything a viewer can know about one run."""
@@ -83,6 +99,10 @@ class RunState:
     task: asyncio.Task[None] | None = None
     #: The live chat channel for this run, if the pipeline has created one.
     channel: ChatChannel | None = None
+    #: The plain-language snapshot the agent answers questions from.
+    progress: RunProgress | None = None
+    #: The reply strategy, held so its provider connections can be released.
+    responder: ConversationalResponder | None = None
 
     def summary(self) -> dict[str, Any]:
         """Flat status payload for the browser."""
@@ -113,6 +133,10 @@ class RunState:
                 "findings": result.findings,
                 "benchmark": result.benchmark.as_dict() if result.benchmark else None,
                 "browser": result.browser.as_dict() if result.browser else None,
+                "interaction": (
+                    result.interaction.as_dict() if result.interaction else None
+                ),
+                "full_video_key": result.full_video_key,
                 "citations": [
                     {
                         "signal": outcome.signal,
@@ -167,6 +191,13 @@ class RunRegistry:
         # The channel is created here so the API can expose it for answers
         # before the pipeline even starts.
         state.channel = ChatChannel(bus)
+        # Answering starts here rather than inside the pipeline. Reconnaissance
+        # alone takes tens of seconds, and a message typed during it must be
+        # queued and answered -- not mistaken for one sent after the run ended.
+        state.progress = RunProgress(target=url)
+        responder = ConversationalResponder(state.progress, settings=self._settings)
+        state.responder = responder
+        state.channel.start_responding(responder, aclose=responder.aclose)
         state.task = asyncio.create_task(self._drive(state, bus))
         self._runs[stream_id] = state
         return state
@@ -181,6 +212,7 @@ class RunRegistry:
                 self._artifacts,
                 bus=bus,
                 channel=state.channel,
+                progress=state.progress,
             )
         except Exception as exc:
             state.status = "failed"
@@ -190,6 +222,13 @@ class RunRegistry:
             # the stream waiting forever for an event that never comes.
             await bus.emit(EventType.RUN_FAILED, error=state.error)
             return
+        finally:
+            # The pipeline closes this itself on the normal path. Doing it again
+            # here covers a crash, which would otherwise leave a responder loop
+            # alive for a run that no longer exists -- still answering the
+            # operator as though the scan were still going.
+            if state.channel is not None:
+                await state.channel.aclose_responding()
         state.status = "succeeded"
 
     def findings(self, state: RunState) -> list[dict[str, Any]]:
@@ -339,6 +378,34 @@ def create_app(settings: Settings) -> FastAPI:
                 status_code=404,
                 detail=f"No pending question with id {request.message_id!r}",
             )
+        return {"ok": True}
+
+    @app.post("/api/runs/{stream_id}/message")
+    async def post_message(stream_id: str, request: MessageRequest) -> dict[str, Any]:
+        """Accept a free-form message, whether or not a question is pending.
+
+        The dashboard's chat box is always enabled, so a typed message usually
+        has no question to attach to. Recording it and letting the run's
+        responder loop answer it is the whole difference between an agent that
+        talks back and one that appears to ignore the operator.
+        """
+        state = registry.get(stream_id)
+        if state is None:
+            raise HTTPException(status_code=404, detail=f"unknown run {stream_id!r}")
+        if state.channel is None:
+            raise HTTPException(status_code=400, detail="This run has no chat channel")
+
+        text = request.text.strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="Empty message")
+
+        await state.channel.post(text)
+        if state.status != "running" or not state.channel.responding:
+            # Nothing is draining the inbox: the run has finished, or it is in
+            # the last moments of shutting down. Answer here rather than let the
+            # message sit unanswered. It is still recorded, so the conversation
+            # stays complete either way.
+            await state.channel.inform(FINISHED_RUN_REPLY)
         return {"ok": True}
 
     return app

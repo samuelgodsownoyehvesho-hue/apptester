@@ -133,43 +133,6 @@ def test_stored_artifacts_are_served(tmp_path: Path) -> None:
 class TestAnswerEndpoint:
     """POST /api/runs/{id}/answer routes replies to the live chat channel."""
 
-    def _make_app(self, tmp_path: Path) -> tuple[TestClient, object]:
-        """Create an app and return both the test client and its registry."""
-        from crucible.api.app import RunRegistry as _Reg
-
-        settings = Settings(
-            crucible_db_url=f"sqlite:///{tmp_path / 'ans.db'}",
-            crucible_artifacts_dir=tmp_path / "artifacts",
-            gemini_api_key="",
-            nvidia_api_key="",
-            enable_gemini=False,
-            enable_nvidia=False,
-            enable_ollama=False,
-            _env_file=None,
-        )
-        from crucible.store.artifacts import ArtifactStore as _AS
-        from crucible.store.db import (
-            ensure_parent_dir,
-            init_db,
-            make_engine,
-            make_session_factory,
-        )
-
-        ensure_parent_dir(settings.crucible_db_url)
-        engine = make_engine(settings.crucible_db_url)
-        init_db(engine)
-        sf = make_session_factory(engine)
-        artifacts = _AS(Path(settings.crucible_artifacts_dir))
-        reg = _Reg(settings, sf, artifacts)
-
-        # Monkey-patch the app module's registry so create_app sees ours.
-        import crucible.api.app as _app_mod
-        original = _app_mod.create_app.__wrapped__ if hasattr(_app_mod.create_app, "__wrapped__") else None
-        app = _app_mod.create_app(settings)
-        # Inject the registry by reaching into the closure.
-        # Simpler: just start a run and use the channel directly.
-        return TestClient(app), _app_mod, settings
-
     def test_answer_unknown_run_is_404(self, tmp_path: Path) -> None:
         settings = Settings(
             crucible_db_url=f"sqlite:///{tmp_path / 'ans2.db'}",
@@ -188,10 +151,14 @@ class TestAnswerEndpoint:
             )
             assert resp.status_code == 404
 
-    def test_answer_accepted(self, tmp_path: Path) -> None:
-        """Starting a run creates a channel; answering a known id returns 200."""
-        import time as _time
+    def test_a_started_run_exposes_an_empty_conversation(self, tmp_path: Path) -> None:
+        """A started run exists immediately with a conversation the browser can read.
 
+        Submitting an answer is covered by the chat unit tests, which can reach
+        the channel directly; this is the HTTP-visible half -- the dashboard must
+        be able to subscribe to a run and find its conversation before anything
+        has been said.
+        """
         settings = Settings(
             crucible_db_url=f"sqlite:///{tmp_path / 'ans3.db'}",
             crucible_artifacts_dir=tmp_path / "a",

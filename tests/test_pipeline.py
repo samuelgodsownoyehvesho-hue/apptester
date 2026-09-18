@@ -9,6 +9,7 @@ these tests worth their runtime.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from crucible.benchmark.score import Manifest, fetch_manifest, score
 from crucible.core.config import Settings
+from crucible.core.events import EventBus
+from crucible.core.qa import ChatChannel
 from crucible.execute.browser import BrowserUnavailable
 from crucible.execute.checks import CheckResult
 from crucible.execute.client import ApiResponse, AppClient, reset_target
@@ -416,6 +419,60 @@ async def test_browser_lane_can_be_switched_off(
 
     assert result.browser is None
     assert result.findings == 0
+
+
+@pytest.mark.asyncio
+async def test_an_operator_message_is_answered_during_a_run(
+    db: sessionmaker[Session], artifacts: ArtifactStore
+) -> None:
+    """A message typed at a running scan gets a reply, and the log keeps it.
+
+    This is the exact defect this test exists for: the operator's message was
+    appended to the conversation and pushed onto the channel's inbox, and
+    nothing ever read that inbox -- so their own words appeared on screen and
+    the agent was silent forever after. The reply now has to be grounded in what
+    the run has actually observed, and the conversation has to reach the disk
+    rather than living only in memory.
+    """
+    fake = FakeGuineaPig(simulate={"CART_QTY_IGNORED"})
+    bus = EventBus("live_0001")
+    channel = ChatChannel(bus)
+    # Posted before the run starts, which is the hardest ordering: the responder
+    # does not exist yet, so this has to be queued rather than dropped.
+    await channel.post("how far along are you?")
+
+    result = await run_pipeline(
+        "http://guinea.test",
+        _settings(),
+        db,
+        artifacts,
+        fetcher=StaticSiteFetcher(),
+        app_client=fake,
+        bus=bus,
+        channel=channel,
+    )
+
+    assert result.routes > 0
+    conversation = result.conversation
+    asked_at = next(
+        index
+        for index, message in enumerate(conversation)
+        if message["role"] == "human" and message["text"] == "how far along are you?"
+    )
+    # The narration the pipeline emits on its own never mentions mapped pages in
+    # these words, so this can only be the grounded reply.
+    replies = [
+        message["text"]
+        for message in conversation[asked_at + 1 :]
+        if message["role"] == "agent" and "page(s) mapped" in message["text"]
+    ]
+    assert replies, f"the operator's message was never answered: {conversation}"
+
+    # The conversation has to outlive the process that produced it.
+    log_path = artifacts.root / result.run_id / "conversation.json"
+    assert log_path.exists()
+    saved = json.loads(log_path.read_text(encoding="utf-8"))
+    assert len(saved) == len(conversation)
 
 
 def test_score_flags_label_without_violated_signal() -> None:

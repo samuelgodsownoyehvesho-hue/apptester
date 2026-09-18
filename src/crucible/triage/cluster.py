@@ -49,6 +49,7 @@ SEVERITY_BY_SIGNAL: dict[str, Severity] = {
     "metamorphic": Severity.HIGH,
     "http": Severity.MEDIUM,
     "accessibility": Severity.MEDIUM,
+    "interaction": Severity.HIGH,
 }
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +78,21 @@ class Narrative:
 #: One narrative per check, keyed by check id. A check with no entry still
 #: produces a finding; it just falls back to the raw evidence.
 _NARRATIVE: dict[str, Narrative] = {
+    "ui_interaction": Narrative(
+        summary="A control on the page does not work when it is used",
+        cause=(
+            "Something a visitor can click, type into or choose fails when it is "
+            "actually used: the page throws a JavaScript error, a request comes "
+            "back failing, the interaction hangs, or nothing at all happens. "
+            "This only appears once the page is driven in a real browser, which "
+            "is why no server-side check ever reports it."
+        ),
+        fix=(
+            "Reproduce it by hand: open the page, use that control, and watch the "
+            "browser console and network tab. The screenshot stored with this "
+            "finding shows the page in the state the interaction left it."
+        ),
+    ),
     "cart_quantity_arithmetic": Narrative(
         summary="The cart charges for one item when you order several",
         cause=(

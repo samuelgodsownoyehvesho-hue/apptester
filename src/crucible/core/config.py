@@ -53,13 +53,30 @@ class Settings(BaseSettings):
     # --- Tier 2: NVIDIA NIM (PUBLIC + PROPRIETARY) ---
     nvidia_api_key: SecretStr = SecretStr("")
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
-    nvidia_model: str = "meta/llama-3.3-70b-instruct"
+    # Model ids on this catalogue are retired on a schedule: the previous default
+    # (meta/llama-3.3-70b-instruct) was withdrawn and now answers every request
+    # with 410 Gone. Verify against {nvidia_base_url}/models rather than trusting
+    # this name, and treat a 404 "not found for account" as "not entitled".
+    nvidia_model: str = "meta/llama-3.2-11b-vision-instruct"
     enable_nvidia: bool = True
 
     # --- Tier 3: Ollama (local, optional) ---
     ollama_base_url: str = "http://localhost:11434/v1"
     ollama_model: str = "qwen2.5:7b"
     enable_ollama: bool = False
+
+    # --- Interaction lane: press everything reconnaissance found ---
+    interact_enabled: bool = True
+    #: 0 means no ceiling. Coverage is the point of the lane, so the default
+    #: exercises every element found; set a number only to bound a run on
+    #: purpose, because a silently truncated pass reads as coverage it is not.
+    interact_max_elements: int = 0
+    #: A control that hangs must fail its own check, never stall the others.
+    interact_timeout_ms: int = Field(default=15_000, gt=0)
+    interact_settle_ms: int = Field(default=500, ge=0)
+    #: Spacing between interactions, so a thorough pass does not trip the rate
+    #: limiter of a real deployed site and lose the rest of the run to it.
+    interact_delay_ms: int = Field(default=150, ge=0)
 
     # --- Budgets: hard stops, not warnings ---
     max_run_cost_usd: float = Field(default=2.00, gt=0)

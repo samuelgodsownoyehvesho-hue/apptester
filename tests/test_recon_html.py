@@ -8,6 +8,8 @@ report that control as labelled and the defect would become undetectable.
 
 from __future__ import annotations
 
+from crucible.execute.checks import CheckResult
+from crucible.oracle.signals import SIGNALS_BY_CHECK, signal_ui_interaction
 from crucible.recon.html import extract_page_facts
 
 BASE = "http://localhost:3100"
@@ -158,3 +160,121 @@ class TestPageMetadata:
         payload = extract_page_facts("<title>T</title>", BASE).as_dict()
         assert payload["url"] == BASE
         assert payload["title"] == "T"
+
+
+def _elements(html: str) -> list[object]:
+    return list(extract_page_facts(html, BASE).elements)
+
+
+class TestElementInventory:
+    """The interaction lane has nothing to press without this inventory.
+
+    Every control a page offers has to be named here, because the lane works
+    only from what reconnaissance found: a button this misses is a button that
+    is never tested, and the run still reports as complete.
+    """
+
+    def test_buttons_and_links_are_inventoried_with_their_text(self) -> None:
+        html = """
+        <html><body>
+          <button>Add to cart</button>
+          <button aria-label="Close dialog"></button>
+          <a href="/catalog">Browse the catalog</a>
+        </body></html>
+        """
+        elements = _elements(html)
+        assert {(e.kind, e.label) for e in elements} == {
+            ("button", "Add to cart"),
+            ("button", "Close dialog"),
+            ("link", "Browse the catalog"),
+        }
+
+    def test_an_id_gives_a_selector_a_static_parse_can_trust(self) -> None:
+        elements = _elements('<html><body><button id="buy-now">Buy</button></body></html>')
+        assert elements[0].selector == "#buy-now"
+
+    def test_hidden_inputs_have_nothing_to_press(self) -> None:
+        """A hidden field is not a control, so pressing it is not a test."""
+        elements = _elements(
+            '<html><body><input type="hidden" name="csrf" value="x"></body></html>'
+        )
+        assert elements == []
+
+    def test_select_options_are_recorded_for_exercise(self) -> None:
+        elements = _elements(
+            '<html><body><select name="sort">'
+            "<option value='a'>Price: low to high</option>"
+            "<option value='b'>Price: high to low</option>"
+            "</select></body></html>"
+        )
+        assert elements[0].kind == "select"
+        assert elements[0].options == ("Price: low to high", "Price: high to low")
+
+    def test_a_click_handler_makes_a_non_semantic_element_a_control(self) -> None:
+        elements = _elements('<html><body><div onclick="open()">Open menu</div></body></html>')
+        assert elements[0].kind == "clickable"
+        assert elements[0].label == "Open menu"
+
+    def test_every_control_on_a_page_is_kept(self) -> None:
+        """A low ceiling would read as a clean page rather than a truncated one."""
+        buttons = "".join(f"<button>Action {index}</button>" for index in range(120))
+        elements = _elements(f"<html><body>{buttons}</body></html>")
+        assert len(elements) == 120
+
+
+class TestInteractionSignal:
+    """A control that breaks must reach the report as a defect."""
+
+    def test_a_javascript_error_is_a_violation(self) -> None:
+        outcome = signal_ui_interaction(
+            CheckResult(
+                check_id="ui_interaction",
+                lane="ui",
+                observation="",
+                facts={
+                    "route": "/checkout",
+                    "kind": "button",
+                    "label": "Place order",
+                    "failure": "js_error",
+                    "js_error": "TypeError: cannot read property 'total' of null",
+                },
+            )
+        )
+        assert outcome.violated is True
+        assert "Place order" in outcome.detail
+        assert "JavaScript error" in outcome.detail
+        # A broken button is not one of the target's declared defects, so no id
+        # is claimed: inventing one would corrupt the benchmark with a fake hit.
+        assert outcome.suspected_bug_id is None
+
+    def test_a_control_that_behaved_is_not_a_violation(self) -> None:
+        outcome = signal_ui_interaction(
+            CheckResult(
+                check_id="ui_interaction",
+                lane="ui",
+                observation="",
+                facts={"route": "/", "kind": "link", "label": "Catalog", "failure": None},
+            )
+        )
+        assert outcome.violated is False
+
+    def test_a_hanging_control_is_a_violation(self) -> None:
+        outcome = signal_ui_interaction(
+            CheckResult(
+                check_id="ui_interaction",
+                lane="ui",
+                observation="",
+                facts={
+                    "route": "/",
+                    "kind": "button",
+                    "label": "Search",
+                    "failure": "timeout",
+                    "detail": "TimeoutError: 15000ms exceeded",
+                },
+            )
+        )
+        assert outcome.violated is True
+        assert "never finished" in outcome.detail
+
+    def test_every_interaction_check_has_a_signal_registered(self) -> None:
+        assert "ui_interaction" in SIGNALS_BY_CHECK

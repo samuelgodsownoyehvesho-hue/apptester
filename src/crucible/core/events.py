@@ -48,12 +48,24 @@ class EventType(StrEnum):
     BROWSER_FINISHED = "browser.finished"
     BROWSER_UNAVAILABLE = "browser.unavailable"
 
+    #: The interaction lane: pressing, typing into, and choosing from the
+    #: controls reconnaissance found. Distinct from the browser walk, which only
+    #: looks.
+    INTERACT_STARTED = "interact.started"
+    INTERACT_ELEMENT_STARTED = "interact.element_started"
+    INTERACT_ELEMENT_FINISHED = "interact.element_finished"
+    INTERACT_FINISHED = "interact.finished"
+    INTERACT_UNAVAILABLE = "interact.unavailable"
+
     ORACLE_SIGNAL = "oracle.signal"
     VERDICT_REACHED = "oracle.verdict"
     FINDING_RECORDED = "triage.finding"
 
     QUESTION_ASKED = "question.asked"
     ANSWER_RECEIVED = "question.answered"
+    #: A human message that was not a reply to a question. The pipeline answers
+    #: it with the run's current progress instead of ignoring it.
+    HUMAN_MESSAGE = "human.message"
 
     BUDGET_WARNING = "budget.warning"
 

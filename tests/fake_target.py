@@ -36,11 +36,24 @@ class FakeGuineaPig:
         self.with_manifest = with_manifest
         self.lines: list[dict[str, Any]] = []
         self.discount_rate = 0.0
+        self._closed = False
         #: EMPTY_CART_STALE_TOTAL: totals the app failed to recompute after the
         #: last line was removed, which then stick in subsequent read-backs.
         self.stale_totals: dict[str, Any] | None = None
 
     # -- helpers -------------------------------------------------------
+
+    def _ensure_open(self) -> None:
+        """Fail loudly when used after close, exactly as a real transport does.
+
+        httpx raises rather than quietly failing, and a double that kept
+        answering hid a genuine bug: the pipeline closed the client and then ran
+        every check through it, so each one errored, the oracle declined to call
+        that evidence, and the run reported a single finding while looking
+        entirely healthy. A fake that cannot fail cannot catch that.
+        """
+        if self._closed:
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
 
     def _fresh_cart(self) -> dict[str, Any]:
         subtotal = _round2(
@@ -93,6 +106,7 @@ class FakeGuineaPig:
     # -- AppClient protocol ---------------------------------------------
 
     async def get(self, path: str, *, params: dict[str, str] | None = None) -> ApiResponse:
+        self._ensure_open()
         params = params or {}
         if path == "/api/cart":
             return self._json(self._cart())
@@ -127,6 +141,7 @@ class FakeGuineaPig:
         return ApiResponse(status=404, text="not found")
 
     async def post(self, path: str, json_body: Any) -> ApiResponse:
+        self._ensure_open()
         if path == "/api/ground-truth/reset":
             self.lines = []
             self.discount_rate = 0.0
@@ -165,6 +180,7 @@ class FakeGuineaPig:
         return ApiResponse(status=404, text="not found")
 
     async def delete(self, path: str, *, params: dict[str, str] | None = None) -> ApiResponse:
+        self._ensure_open()
         if path == "/api/cart":
             product_id = (params or {}).get("productId", "")
             before = self._fresh_cart()
@@ -183,13 +199,13 @@ class FakeGuineaPig:
         return ApiResponse(status=404, text="not found")
 
     async def aclose(self) -> None:
-        return None
+        self._closed = True
 
     async def __aenter__(self) -> FakeGuineaPig:
         return self
 
     async def __aexit__(self, *_exc: object) -> None:
-        return None
+        await self.aclose()
 
     # -- catalog --------------------------------------------------------
 

@@ -50,6 +50,7 @@ class RouteInfo:
     link_count: int = 0
     form_count: int = 0
     unlabelled_control_count: int = 0
+    element_count: int = 0
     error: str | None = None
     truncated: bool = False
 
@@ -81,6 +82,10 @@ class AppMapData:
     routes: list[RouteInfo] = field(default_factory=list)
     forms: list[dict[str, Any]] = field(default_factory=list)
     unlabelled_controls: list[dict[str, Any]] = field(default_factory=list)
+    #: Every interactive element found, tagged with the route it lives on. This
+    #: is what the interaction lane works from: without an inventory of what can
+    #: be pressed, a browser can only look at a page, never exercise it.
+    elements: list[dict[str, Any]] = field(default_factory=list)
     api_operations: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     crawled_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -106,6 +111,8 @@ class AppMapData:
             "routes": [route.as_dict() for route in self.routes],
             "forms": self.forms,
             "unlabelled_controls": self.unlabelled_controls,
+            "element_count": len(self.elements),
+            "elements": self.elements,
             "api_operations": self.api_operations,
             "notes": self.notes,
         }
@@ -272,6 +279,10 @@ class Scout:
 
                 for control in facts.unlabelled_controls:
                     result.unlabelled_controls.append({"page": path, **control.as_dict()})
+
+                route.element_count = len(facts.elements)
+                for element in facts.elements:
+                    result.elements.append({"page": path, **element.as_dict()})
 
                 if depth < self._max_depth:
                     for link in facts.links:

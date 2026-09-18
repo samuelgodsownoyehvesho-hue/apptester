@@ -407,6 +407,83 @@ def signal_routes_respond(result: CheckResult) -> SignalOutcome:
     )
 
 
+# ------------------------------------------------------- interaction signal
+
+#: How each way an interaction can fail is explained to a reader. The point of
+#: the lane is that these are invisible to every text-based check, so the words
+#: have to carry the reason rather than name an internal failure code.
+_INTERACTION_FAILURES: dict[str, str] = {
+    "js_error": "pressing it made the page throw a JavaScript error",
+    "http_error": "pressing it triggered a failing HTTP response",
+    "timeout": "it never finished -- the page hung and the control never returned",
+    "no_change": "nothing happened: no navigation, no visible change and no request",
+    "unreachable": "the control is not there once the page renders",
+    "error": "it raised an error that stopped the interaction",
+}
+
+#: Confidence per failure kind. An uncaught exception or a 5xx is unambiguous.
+#: A control that appears to do nothing is weaker evidence -- some buttons act
+#: through side effects this lane cannot see -- so it is reported, but not with
+#: the certainty of a crash.
+_INTERACTION_CONFIDENCE: dict[str, float] = {
+    "js_error": 0.9,
+    "http_error": 0.9,
+    "timeout": 0.85,
+    "no_change": 0.6,
+    "unreachable": 0.5,
+    "error": 0.7,
+}
+
+
+def signal_ui_interaction(result: CheckResult) -> SignalOutcome:
+    """A control that errors, hangs or does nothing is a defect in the page.
+
+    This is the signal that makes the interaction lane worth running: without it
+    every click is an observation nobody reads. It deliberately claims no known
+    defect id -- a broken button is not one of the target's declared defects, and
+    inventing an id for it would corrupt the benchmark by inventing a hit.
+    """
+    if result.check_id != "ui_interaction":
+        return SignalOutcome("interaction", result.check_id, None, 0.0, "not applicable")
+
+    failure = result.facts.get("failure")
+    if not isinstance(failure, str) or not failure:
+        return SignalOutcome(
+            "interaction",
+            result.check_id,
+            False,
+            0.5,
+            f"{result.facts.get('kind')} "
+            f"{result.facts.get('label')!r} on {result.facts.get('route')} behaved",
+            {"facts": result.facts},
+        )
+
+    reason = _INTERACTION_FAILURES.get(failure, f"it failed ({failure})")
+    where = f"{result.facts.get('kind')} {result.facts.get('label')!r} "
+    where += f"on {result.facts.get('route')}"
+    detail = result.facts.get("js_error") or result.facts.get("detail") or ""
+    return SignalOutcome(
+        "interaction",
+        result.check_id,
+        True,
+        _INTERACTION_CONFIDENCE.get(failure, 0.6),
+        f"on {where}: {reason}"
+        + (f" -- {detail}" if detail else ""),
+        {
+            "route": result.facts.get("route"),
+            "kind": result.facts.get("kind"),
+            "label": result.facts.get("label"),
+            "selector": result.facts.get("selector"),
+            "failure": failure,
+            "js_error": result.facts.get("js_error"),
+            "http_status": result.facts.get("http_status"),
+            "before_key": result.facts.get("before_key"),
+            "after_key": result.facts.get("after_key"),
+        },
+        suspected_bug_id=None,
+    )
+
+
 # ------------------------------------------------------ recon-derived signal
 
 
@@ -453,6 +530,7 @@ SIGNALS_BY_CHECK: dict[str, tuple[Any, ...]] = {
     "pagination_disjoint": (signal_pagination_disjoint,),
     "negative_quantity_rejected": (signal_negative_quantity,),
     "referenced_routes_respond": (signal_routes_respond,),
+    "ui_interaction": (signal_ui_interaction,),
 }
 
 
